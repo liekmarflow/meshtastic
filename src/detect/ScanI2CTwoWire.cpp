@@ -366,9 +366,20 @@ void ScanI2CTwoWire::scanPort(I2CPort port, uint8_t *address, uint8_t asize)
                         logFoundDevice("INA260", (uint8_t)addr.address);
                         type = INA260;
                     }
-                } else { // Assume INA219 if INA260 ID is not found
-                    logFoundDevice("INA219", (uint8_t)addr.address);
-                    type = INA219;
+                } else {
+                    // Check for INA228/INA229 (MFG_ID at register 0x3E instead of 0xFE)
+                    registerValue = getRegisterValue(ScanI2CTwoWire::RegisterLocation(addr, 0x3E), 2);
+                    LOG_DEBUG("Register MFG_UID_3E: 0x%x", registerValue);
+                    if (registerValue == 0x5449) {
+                        registerValue = getRegisterValue(ScanI2CTwoWire::RegisterLocation(addr, 0x3F), 2);
+                        LOG_DEBUG("Register DEV_ID_3F: 0x%x", registerValue);
+                        logFoundDevice("INA228", (uint8_t)addr.address);
+                        type = INA228;
+                    } else {
+                        // Assume INA219 if no TI device ID found
+                        logFoundDevice("INA219", (uint8_t)addr.address);
+                        type = INA219;
+                    }
                 }
                 break;
             case INA3221_ADDR:

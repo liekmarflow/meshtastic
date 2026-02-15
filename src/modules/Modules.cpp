@@ -97,6 +97,10 @@
 #include "modules/StatusMessageModule.h"
 #endif
 
+#ifdef INHERO_MR2
+#include "InheroMr2Module.h"
+#endif
+
 #if defined(HAS_HARDWARE_WATCHDOG)
 #include "watchdog/watchdogThread.h"
 #endif
@@ -244,6 +248,9 @@ void setupModules()
 #endif
 #if defined(HAS_HARDWARE_WATCHDOG)
     watchdogThread = new WatchdogThread();
+#endif
+#ifdef INHERO_MR2
+    new InheroMr2Module();
 #endif
     // NOTE! This module must be added LAST because it likes to check for replies from other modules and avoid sending extra
     // acks

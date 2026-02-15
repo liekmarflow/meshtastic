@@ -197,6 +197,14 @@ static const uint8_t SCK = PIN_SPI_SCK;
 // Buzzer on IO3 (Slot C)
 #define PIN_BUZZER 21
 
+// Onboard sensor configuration
+#define HAS_TELEMETRY 1
+#define HAS_SENSOR 1
+
+// INA228 power monitor on I2C (0x40) - handled by InheroMr2Module
+// BQ25798 solar charger on I2C (0x6B) - handled by InheroMr2Module
+// RV-3028 RTC on I2C (0x52) - handled by Meshtastic RTC infrastructure
+
 #ifdef __cplusplus
 }
 #endif

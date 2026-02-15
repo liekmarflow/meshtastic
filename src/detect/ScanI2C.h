@@ -70,6 +70,7 @@ class ScanI2C
         MPR121KB,
         CGRADSENS,
         INA226,
+        INA228,
         NXP_SE050,
         DFROBOT_RAIN,
         DPS310,

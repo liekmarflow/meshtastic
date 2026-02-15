@@ -22,6 +22,10 @@
 #include "nrf.h"
 #include "wiring_constants.h"
 #include "wiring_digital.h"
+#include <Wire.h>
+
+// Include INA228 driver for early boot voltage check
+#include "Ina228Driver.h"
 
 const uint32_t g_ADigitalPinMap[] = {
     // P0
@@ -42,4 +46,25 @@ void initVariant()
     // 3V3 Power Rail
     pinMode(PIN_3V3_EN, OUTPUT);
     digitalWrite(PIN_3V3_EN, HIGH);
+
+    // Early boot voltage check via INA228
+    // Prevents motorboating (boot-crash-reboot loop) when battery is critically low
+    Wire.begin();
+    delay(5); // Give I2C bus time to stabilize
+
+    uint16_t vbat_mv = Ina228Driver::readVBATDirect(&Wire, INA228_I2C_ADDR_DEFAULT);
+    if (vbat_mv > 0 && vbat_mv < 2800) {
+        // Battery dangerously low - go directly to deep sleep
+        // Turn off 3V3 rail and LEDs
+        digitalWrite(PIN_3V3_EN, LOW);
+        ledOff(PIN_LED1);
+        ledOff(PIN_LED2);
+
+        // Enter System OFF mode (lowest power, ~1µA)
+        // Will wake on USB connection (VBUS detect) or RTC alarm
+        NRF_POWER->SYSTEMOFF = 1;
+        __DSB();
+        while (1)
+            ; // Should never reach here
+    }
 }
