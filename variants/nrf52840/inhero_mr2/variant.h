@@ -205,6 +205,10 @@ static const uint8_t SCK = PIN_SPI_SCK;
 // BQ25798 solar charger on I2C (0x6B) - handled by InheroMr2Module
 // RV-3028 RTC on I2C (0x52) - handled by Meshtastic RTC infrastructure
 
+// Enable InheroMr2Module as battery level provider for Meshtastic Power system.
+// This feeds chemistry-aware SOC and INA228 voltage into DeviceMetrics telemetry.
+#define INHERO_MR2_POWER
+
 #ifdef __cplusplus
 }
 #endif

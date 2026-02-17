@@ -700,6 +700,8 @@ bool Power::setup()
         found = true;
     } else if (serialBatteryInit()) {
         found = true;
+    } else if (inheroMr2Init()) {
+        found = true;
     } else if (meshSolarInit()) {
         found = true;
     } else if (analogInit()) {
@@ -1614,6 +1616,74 @@ bool Power::lipoChargerInit()
  * The Lipo battery level sensor is unavailable - default to AnalogBatteryLevel
  */
 bool Power::lipoChargerInit()
+{
+    return false;
+}
+#endif
+
+// ============================================================================
+// Inhero MR-2: Chemistry-aware battery level via INA228 + BQ25798
+// ============================================================================
+#ifdef INHERO_MR2_POWER
+#include "InheroMr2Module.h"
+
+/**
+ * Battery level provider for Inhero MR-2 boards.
+ * Uses the InheroMr2Module singleton for INA228 voltage, chemistry-aware SOC,
+ * and BQ25798 charging state. This feeds correct values into Meshtastic's
+ * DeviceMetrics telemetry regardless of battery chemistry.
+ */
+class InheroMr2BatteryLevel : public HasBatteryLevel
+{
+  public:
+    virtual int getBatteryPercent() override
+    {
+        auto *mod = InheroMr2Module::getInstance();
+        if (!mod || !mod->hasBattery())
+            return 0; // Return 0 (not -1) to avoid OCV fallback with wrong LiIon table
+        return mod->getBatterySOC();
+    }
+
+    virtual uint16_t getBattVoltage() override
+    {
+        auto *mod = InheroMr2Module::getInstance();
+        return mod ? mod->getBatteryVoltageMv() : 0;
+    }
+
+    virtual bool isBatteryConnect() override
+    {
+        auto *mod = InheroMr2Module::getInstance();
+        return mod ? mod->hasBattery() : false;
+    }
+
+    virtual bool isVbusIn() override
+    {
+        auto *mod = InheroMr2Module::getInstance();
+        return mod ? mod->hasExternalPower() : false;
+    }
+
+    virtual bool isCharging() override
+    {
+        auto *mod = InheroMr2Module::getInstance();
+        return mod ? mod->isBatteryCharging() : false;
+    }
+};
+
+static InheroMr2BatteryLevel inheroMr2Level;
+
+bool Power::inheroMr2Init()
+{
+    // Always succeed — the InheroMr2BatteryLevel methods safely handle
+    // the case where InheroMr2Module isn't initialized yet (returns 0/false).
+    // Power::setup() runs before modules, so the module won't be ready at init,
+    // but will provide real values once its setupDrivers() completes.
+    batteryLevel = &inheroMr2Level;
+    LOG_INFO("Power::inheroMr2Init - using INA228 + chemistry-aware SOC");
+    return true;
+}
+
+#else
+bool Power::inheroMr2Init()
 {
     return false;
 }

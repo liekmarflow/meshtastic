@@ -1,15 +1,39 @@
 {
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "type": "PlatformIO",
-      "task": "Build",
-      "problemMatcher": ["$platformio"],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "label": "PlatformIO: Build"
-    }
-  ]
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "PlatformIO",
+			"task": "Build",
+			"problemMatcher": [
+				"$platformio"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"label": "PlatformIO: Build"
+		},
+		{
+			"label": "Build inhero_mr2",
+			"type": "shell",
+			"command": "C:\\Users\\wolfr\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"--environment",
+				"inhero_mr2"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build inhero_mr2",
+			"type": "shell",
+			"command": "C:\\Users\\wolfr\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"--environment",
+				"inhero_mr2"
+			],
+			"group": "build"
+		}
+	]
 }

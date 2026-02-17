@@ -111,6 +111,8 @@ class Power : private concurrency::OSThread
     bool lipoChargerInit();
     /// Setup a meshSolar battery sensor
     bool meshSolarInit();
+    /// Setup Inhero MR-2 battery sensor (INA228 + chemistry-aware SOC)
+    bool inheroMr2Init();
     /// Setup a serial battery sensor
     bool serialBatteryInit();
 

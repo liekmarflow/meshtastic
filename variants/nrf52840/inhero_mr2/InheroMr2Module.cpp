@@ -4,7 +4,48 @@
  * SPDX-License-Identifier: MIT
  *
  * Inhero MR-2 Board Module - Implementation
- * MeshCore-compatible CLI via Meshtastic text message DMs.
+ * Full MeshCore feature parity via Meshtastic text message DMs.
+ *
+ * This module implements the complete Inhero MR-2 board support:
+ *
+ * === Hardware Drivers ===
+ *  - INA228 power monitor (24-bit, Coulomb counting)
+ *  - BQ25798 solar charger (MPPT, JEITA, multi-chemistry)
+ *  - RV-3028 RTC detection (for timestamps + wake-from-sleep)
+ *
+ * === Power Management ===
+ *  - Battery chemistry: LTO 2S / LiFePO4 1S / Li-Ion 1S
+ *  - SOC: INA228 hardware Coulomb counting, auto-sync on charge-done
+ *  - UVLO: Hardware alert via INA228, danger-zone shutdown
+ *  - skipFsWrites: Prevents flash corruption on low-voltage boot
+ *
+ * === System Reliability ===
+ *  - nRF52 hardware watchdog (600s timeout)
+ *  - GPREGRET2 shutdown reason tracking (survives SYSTEMOFF)
+ *  - Controlled shutdown: SX1262 off → RTC wake → SYSTEMOFF
+ *  - Error LED blink for missing I2C components
+ *
+ * === Solar MPPT Management ===
+ *  - Stuck PGOOD fix (HIZ toggle with 5-min cooldown)
+ *  - MPPT re-enable after BQ fault events (60s cooldown)
+ *
+ * === Energy Analytics (168h) ===
+ *  - Hourly rolling buffer for charge/discharge/solar (7 days)
+ *  - Rolling averages: 24h / 3-day / 7-day
+ *  - TTL (Time To Live) estimation
+ *  - MPPT statistics (enabled minutes, harvested energy)
+ *
+ * === CLI over Text-DM ===
+ *  - /get board.<key>: bat telem conf diag hwver frost imax mppt
+ *                       leds uvlo ibcal tccal batcap energy
+ *                       stats cinfo togglehiz
+ *  - /set board.<key> <value>: (admin required)
+ *  - /help /ver /reboot
+ *  - Auth: config.security.admin_key[] (PKI pubkeys)
+ *
+ * === Telemetry ===
+ *  - PowerMetrics Protobuf: ch1=Battery, ch2=Solar, ch3=System
+ *  - HasBatteryLevel integration via InheroMr2BatteryLevel (Power.cpp)
  *
  * Commands are received as normal text messages (DMs) starting with '/'.
  * Write operations require the sender's public key to be registered in
@@ -20,6 +61,11 @@
 #include "mesh/generated/meshtastic/telemetry.pb.h"
 #include <pb_encode.h>
 #include <cctype>
+
+#ifdef ARCH_NRF52
+#include <nrf_wdt.h>
+#include <nrf_soc.h>
+#endif
 
 InheroMr2Module *InheroMr2Module::instance = nullptr;
 
@@ -68,7 +114,16 @@ bool InheroMr2Module::setupDrivers()
 {
     LOG_INFO("InheroMr2: Initializing drivers...");
 
-    // Load persistent configuration
+    // Check GPREGRET2 for low-voltage boot — skip flash writes to prevent corruption
+#ifdef ARCH_NRF52
+    uint8_t shutdownReason = NRF_POWER->GPREGRET2;
+    if ((shutdownReason & 0x03) == SHUTDOWN_REASON_LOW_VOLTAGE) {
+        skipFsWrites = true;
+        LOG_WARN("InheroMr2: Low-voltage boot detected (GPREGRET2=0x%02X) — skipping FS writes", shutdownReason);
+    }
+#endif
+
+    // Load persistent configuration (respects skipFsWrites for first-boot defaults)
     loadConfig();
 
     // Initialize INA228 power monitor (address 0x40 on Wire)
@@ -91,9 +146,43 @@ bool InheroMr2Module::setupDrivers()
         applyChemistryConfig();
         // Configure interrupts for solar events only
         bq25798.configureSolarOnlyInterrupts();
+        // Configure STAT LED based on user preference
+        bq25798.setStatPinEnable(boardConfig.ledsEnabled);
     } else {
         LOG_WARN("InheroMr2: BQ25798 FAILED");
     }
+
+    // Detect RV-3028 RTC for hourly stats timestamps
+    Wire.beginTransmission(0x52);
+    rtcOk = (Wire.endTransmission() == 0);
+    if (rtcOk) {
+        LOG_INFO("InheroMr2: RV-3028 RTC OK @ 0x52");
+    } else {
+        LOG_WARN("InheroMr2: RV-3028 RTC not found");
+    }
+
+    // Initialize SOC stats capacity from config
+    socStats.capacity_mah = (float)getEffectiveCapacity();
+
+    // Initialize hourly stats timestamp
+    uint32_t now_time = getTime();
+    if (now_time > 1000000000) {
+        socStats.lastHourUpdateTime = (now_time / 3600) * 3600;
+    } else {
+        socStats.lastHourUpdateTime = 0; // Will init on first RTC availability
+    }
+
+    // Error LED: if any critical component missing, enable error blink
+    if (!ina228Ok || !bq25798Ok || !rtcOk) {
+        errorLedActive = true;
+        LOG_WARN("InheroMr2: Missing components — error LED active");
+        if (!ina228Ok) LOG_WARN("  - INA228 missing");
+        if (!bq25798Ok) LOG_WARN("  - BQ25798 missing");
+        if (!rtcOk) LOG_WARN("  - RV-3028 RTC missing");
+    }
+
+    // Start hardware watchdog (600s timeout, nRF52 only)
+    setupWatchdog();
 
     driversInitialized = true;
     return ina228Ok || bq25798Ok;
@@ -110,6 +199,9 @@ int32_t InheroMr2Module::runOnce()
 
     uint32_t now = millis();
 
+    // Feed hardware watchdog every cycle
+    feedWatchdog();
+
     // Read INA228 battery data
     if (ina228Ok) {
         ina228.readAll(&batteryData);
@@ -119,7 +211,9 @@ int32_t InheroMr2Module::runOnce()
         if (batteryData.voltage_mv > 0 && batteryData.voltage_mv < params.dangerVoltage_mV) {
             LOG_WARN("InheroMr2: Battery DANGER! %umV < %umV danger threshold", batteryData.voltage_mv,
                      params.dangerVoltage_mV);
-            // In danger zone - reduce activity (Meshtastic's power FSM will handle deep sleep)
+            // Initiate controlled shutdown with SX1262 power-off and RTC wake
+            initiateShutdown(SHUTDOWN_REASON_LOW_VOLTAGE);
+            // If initiateShutdown returns (shouldn't), fall through
         }
     }
 
@@ -127,12 +221,33 @@ int32_t InheroMr2Module::runOnce()
     if (bq25798Ok && (now - lastSensorRead > 30000 || lastSensorRead == 0)) {
         solarData = bq25798.getTelemetryData();
         lastSensorRead = now;
+
+        // === Solar Power Management (ported from MeshCore) ===
+        // Check for stuck PGOOD and MPPT re-enable on each solar data read
+        checkAndFixPgoodStuck();
+        checkAndFixSolarLogic();
+    }
+
+    // Update Coulomb counting SOC (every 10s cycle)
+    updateBatterySOC();
+
+    // Update MPPT statistics
+    if (bq25798Ok && boardConfig.mpptEnabled) {
+        updateMpptStats();
     }
 
     // Send telemetry periodically
     if (now - lastTelemetrySend > telemetryIntervalMs || lastTelemetrySend == 0) {
         sendPowerTelemetry();
         lastTelemetrySend = now;
+    }
+
+    // Minute counter for hourly stats (10s * 6 = 60s)
+    minuteCounter++;
+    if (minuteCounter >= 6) { // Every ~60 seconds
+        minuteCounter = 0;
+        // Update hourly statistics (will save when hour boundary crossed)
+        updateHourlyStats();
     }
 
     // Update LED indicators
@@ -288,7 +403,7 @@ void InheroMr2Module::handleCliCommand(const meshtastic_MeshPacket &mp, const ch
         if (strncmp(key, "board.", 6) == 0) {
             handleGetCommand(mp, key + 6);
         } else {
-            sendTextReply(mp, "Err: Try /get board.<key> (bat|telem|conf|diag|hwver|frost|imax|mppt|leds|uvlo|ibcal|tccal|batcap|energy)");
+            sendTextReply(mp, "Err: Try /get board.<key> (bat|telem|conf|diag|hwver|frost|imax|mppt|leds|uvlo|ibcal|tccal|batcap|energy|stats|cinfo|togglehiz)");
         }
 
     } else if (strncmp(cmd, "set ", 4) == 0) {
@@ -325,7 +440,9 @@ void InheroMr2Module::handleCliCommand(const meshtastic_MeshPacket &mp, const ch
         // Send help in multiple messages to avoid payload limit
         sendTextReply(mp,
             "/get board.<key>\n"
-            "  bat telem conf diag hwver frost imax mppt leds uvlo ibcal tccal batcap energy\n"
+            "  bat telem conf diag hwver frost imax mppt\n"
+            "  leds uvlo ibcal tccal batcap energy\n"
+            "  stats cinfo togglehiz\n"
             "/set board.<key> <value> [admin]\n"
             "  bat <lto2s|lifepo1s|liion1s>\n"
             "  imax <10-1000> frost <0|1> mppt <0|1>\n"
@@ -378,24 +495,26 @@ void InheroMr2Module::handleGetCommand(const meshtastic_MeshPacket &mp, const ch
     } else if (strcmp(trimmed, "telem") == 0) {
         // Real-time telemetry: VBAT, IBAT, SOC, VSOL, ISOL (MeshCore format)
         int soc = estimateSOC();
+        const char *socMethod = socStats.soc_valid ? "CC" : "V"; // CC=Coulomb Counting, V=Voltage
         if (ina228Ok && bq25798Ok && solarData) {
             char batCurStr[16], solCurStr[16];
             snprintf(batCurStr, sizeof(batCurStr), "%.1fmA", batteryData.current_ma);
             snprintf(solCurStr, sizeof(solCurStr), "~%.0fmA", (float)solarData->solar.current);
 
             if (soc >= 0) {
-                snprintf(response, sizeof(response), "B:%.2fV/%s/%.0fC SOC:%d%% S:%.2fV/%s",
+                snprintf(response, sizeof(response), "B:%.2fV/%s/%.0fC SOC:%d%%(%s) S:%.2fV/%s",
                          batteryData.voltage_mv / 1000.0f, batCurStr, batteryData.die_temp_c,
-                         soc, solarData->solar.voltage / 1000.0f, solCurStr);
+                         soc, socMethod, solarData->solar.voltage / 1000.0f, solCurStr);
             } else {
                 snprintf(response, sizeof(response), "B:%.2fV/%s/%.0fC SOC:N/A S:%.2fV/%s",
                          batteryData.voltage_mv / 1000.0f, batCurStr, batteryData.die_temp_c,
                          solarData->solar.voltage / 1000.0f, solCurStr);
             }
         } else if (ina228Ok) {
-            snprintf(response, sizeof(response), "B:%.2fV/%.1fmA/%.0fC SOC:%s S:N/A",
+            snprintf(response, sizeof(response), "B:%.2fV/%.1fmA/%.0fC SOC:%s%s S:N/A",
                      batteryData.voltage_mv / 1000.0f, batteryData.current_ma, batteryData.die_temp_c,
-                     soc >= 0 ? String(soc).c_str() : "N/A");
+                     soc >= 0 ? String(soc).c_str() : "N/A",
+                     soc >= 0 ? (socStats.soc_valid ? "%(CC)" : "%(V)") : "");
         } else {
             snprintf(response, sizeof(response), "Err: Sensors not ready");
         }
@@ -453,9 +572,55 @@ void InheroMr2Module::handleGetCommand(const meshtastic_MeshPacket &mp, const ch
             snprintf(response, sizeof(response), "Err: INA228 not initialized");
         }
 
+    } else if (strcmp(trimmed, "stats") == 0) {
+        // Rolling energy statistics (24h / 3d / 7d averages + TTL)
+        if (socStats.currentIndex == 0 && socStats.hours[0].timestamp == 0) {
+            snprintf(response, sizeof(response), "Stats: No data yet (need >= 1 hour)");
+        } else {
+            snprintf(response, sizeof(response),
+                     "24h:%.0f/%.0fmAh 3d:%.0f/%.0f 7d:%.0f/%.0f TTL:%uh MPPT:%.0f%%",
+                     socStats.last_24h_charged_mah, socStats.last_24h_discharged_mah,
+                     socStats.avg_3day_daily_charged_mah, socStats.avg_3day_daily_discharged_mah,
+                     socStats.avg_7day_daily_charged_mah, socStats.avg_7day_daily_discharged_mah,
+                     socStats.ttl_hours, getMpptEnabledPercentage7Day());
+        }
+
+    } else if (strcmp(trimmed, "cinfo") == 0) {
+        // Charger info: PG status, charging state, HIZ, MPPT
+        if (!bq25798Ok) {
+            snprintf(response, sizeof(response), "Err: BQ25798 not initialized");
+        } else {
+            bool pgood = bq25798.getChargerStatusPowerGood();
+            bq_charging_status_t chgSt = bq25798.getChargingStatus();
+            bool hiz = bq25798.getHIZMode();
+            bool mpptEn = bq25798.getMPPTenable();
+            uint16_t vbus = solarData ? solarData->solar.voltage : 0;
+            snprintf(response, sizeof(response),
+                     "PG:%u CHG:%u HIZ:%u MPPT:%u VBUS:%.2fV",
+                     pgood ? 1 : 0, (uint8_t)chgSt, hiz ? 1 : 0, mpptEn ? 1 : 0,
+                     vbus / 1000.0f);
+        }
+
+    } else if (strcmp(trimmed, "togglehiz") == 0) {
+        // Manual HIZ toggle for debugging stuck PGOOD
+        if (!bq25798Ok) {
+            snprintf(response, sizeof(response), "Err: BQ25798 not initialized");
+        } else {
+            bool wasPG = bq25798.getChargerStatusPowerGood();
+            bq25798.setHIZMode(true);
+            delay(200);
+            bq25798.setHIZMode(false);
+            delay(500);
+            bool isPG = bq25798.getChargerStatusPowerGood();
+            bq_charging_status_t st = bq25798.getChargingStatus();
+            snprintf(response, sizeof(response),
+                     "HIZ cycled: PG %u->%u CHG:%u",
+                     wasPG ? 1 : 0, isPG ? 1 : 0, (uint8_t)st);
+        }
+
     } else {
         snprintf(response, sizeof(response),
-                 "Err: Try board.<bat|hwver|frost|imax|telem|conf|diag|mppt|leds|uvlo|ibcal|tccal|batcap|energy>");
+                 "Err: Try board.<bat|hwver|frost|imax|telem|conf|diag|mppt|leds|uvlo|ibcal|tccal|batcap|energy|stats|cinfo|togglehiz>");
     }
 
     sendTextReply(mp, response);
@@ -663,11 +828,14 @@ void InheroMr2Module::handleSetCommand(const meshtastic_MeshPacket &mp, const ch
     } else if (strncmp(keyAndValue, "soc ", 4) == 0) {
         const char *val = keyAndValue + 4;
         while (*val == ' ') val++;
-        int soc = atoi(val);
-        if (soc >= 0 && soc <= 100) {
-            // SOC manual override is informational only in Meshtastic port
-            // (no MeshCore SOC tracker to set)
-            snprintf(response, sizeof(response), "SOC manually set to %d%% (note: no persistent SOC tracker in Meshtastic port)", soc);
+        float soc = atof(val);
+        if (soc >= 0.0f && soc <= 100.0f) {
+            if (setSOCManually(soc)) {
+                snprintf(response, sizeof(response), "SOC set to %.0f%% (Coulomb counting baseline recalculated, cap=%umAh)",
+                         soc, getEffectiveCapacity());
+            } else {
+                snprintf(response, sizeof(response), "Err: INA228 not ready or capacity=0");
+            }
         } else {
             snprintf(response, sizeof(response), "Err: SOC must be 0-100");
         }
@@ -777,9 +945,10 @@ void InheroMr2Module::updateLEDs()
 
     // === LED2 (Red) — Priority-based status indicator ===
     //
-    // Priority 1: DANGER VOLTAGE — 100ms flash every 3s (battery critically low, conserve power)
-    // Priority 2: CLI COMMAND    — 200ms flash (remote admin activity)
-    // Priority 3: OFF            — normal operation (BQ25798 STAT-LED handles charging)
+    // Priority 1: DANGER VOLTAGE  — 100ms flash every 3s (battery critically low, conserve power)
+    // Priority 2: ERROR CONDITION — 500ms on/off blink (missing I2C component)
+    // Priority 3: CLI COMMAND     — 200ms flash (remote admin activity)
+    // Priority 4: OFF             — normal operation (BQ25798 STAT-LED handles charging)
 
     const ChemistryParams &params = getChemistryParams(boardConfig.chemistry);
     bool dangerVoltage = ina228Ok && batteryData.voltage_mv > 0 &&
@@ -793,23 +962,40 @@ void InheroMr2Module::updateLEDs()
         } else {
             ledOff(PIN_LED2);
         }
+    } else if (errorLedActive) {
+        // P2: 500ms on/off — missing I2C component (INA228 or BQ25798)
+        uint32_t phase = millis() % 1000;
+        if (phase < 500) {
+            ledOn(PIN_LED2);
+        } else {
+            ledOff(PIN_LED2);
+        }
     } else if (millis() < cliFlashUntil) {
-        // P2: Brief flash — CLI command was processed
+        // P3: Brief flash — CLI command was processed
         ledOn(PIN_LED2);
     } else {
-        // P3: Off — BQ25798 hardware STAT-LED shows charging state
+        // P4: Off — BQ25798 hardware STAT-LED shows charging state
         ledOff(PIN_LED2);
     }
 }
 
 int InheroMr2Module::estimateSOC()
 {
+    // Primary: Coulomb counting (if calibrated)
+    if (socStats.soc_valid)
+        return constrain((int)socStats.current_soc_percent, 0, 100);
+
+    // Fallback: Voltage-based estimation (before first charge-done calibration)
+    return estimateSOCFromVoltage();
+}
+
+int InheroMr2Module::estimateSOCFromVoltage()
+{
     if (!ina228Ok || batteryData.voltage_mv == 0)
         return -1;
 
     const ChemistryParams &params = getChemistryParams(boardConfig.chemistry);
 
-    // Simple linear SOC estimation based on voltage
     if (batteryData.voltage_mv >= params.fullVoltage_mV)
         return 100;
     if (batteryData.voltage_mv <= params.emptyVoltage_mV)
@@ -819,6 +1005,494 @@ int InheroMr2Module::estimateSOC()
         (int)(((float)(batteryData.voltage_mv - params.emptyVoltage_mV) / (params.fullVoltage_mV - params.emptyVoltage_mV)) *
               100.0f);
     return constrain(soc, 0, 100);
+}
+
+uint32_t InheroMr2Module::getEffectiveCapacity()
+{
+    if (boardConfig.batteryCapacity_mAh > 0)
+        return boardConfig.batteryCapacity_mAh;
+    uint8_t idx = (uint8_t)boardConfig.chemistry;
+    if (idx >= sizeof(defaultBatteryCapacity) / sizeof(defaultBatteryCapacity[0]))
+        idx = (uint8_t)BatteryChemistry::BAT_UNKNOWN;
+    return defaultBatteryCapacity[idx];
+}
+
+void InheroMr2Module::updateBatterySOC()
+{
+    if (!ina228Ok)
+        return;
+
+    // Read INA228 hardware Coulomb counter (mAh)
+    // Positive = charging (into battery), Negative = discharging
+    float charge_mah = ina228.readCharge_mAh();
+
+    // Delta tracking (runs always, independent of SOC validity)
+    if (firstChargeRead) {
+        lastChargeMah = charge_mah;
+        firstChargeRead = false;
+    } else {
+        float delta_mah = charge_mah - lastChargeMah;
+        lastChargeMah = charge_mah;
+
+        // Ignore huge jumps > 10Ah (counter wrap or reset)
+        if (delta_mah > 10000.0f || delta_mah < -10000.0f) {
+            LOG_WARN("InheroMr2: Coulomb counter jump ignored (%.1f mAh)", delta_mah);
+        }
+    }
+
+    // Auto-sync: BQ25798 reports "Charging Done" -> set SOC=100%
+    if (bq25798Ok) {
+        bq_charging_status_t status = bq25798.getChargingStatus();
+        if (status == BQ_CHARGE_DONE) {
+            if (!socStats.soc_valid) {
+                syncSOCToFull(); // First calibration point
+                LOG_INFO("InheroMr2: SOC calibrated to 100%% (first charge-done)");
+            } else if (socStats.current_soc_percent < 99.0f) {
+                syncSOCToFull(); // Re-sync drift
+                LOG_INFO("InheroMr2: SOC re-synced to 100%% (charge-done)");
+            }
+        }
+    }
+
+    if (!socStats.soc_valid)
+        return; // Wait for first calibration
+
+    // === Core SOC formula (ported from MeshCore) ===
+    // Net charge since baseline reset
+    float net_charge_mah = charge_mah - socStats.ina228_baseline_mah;
+
+    // Remaining = capacity + net charge (net is negative when discharging)
+    uint32_t capacity = getEffectiveCapacity();
+    if (capacity == 0)
+        return;
+
+    float remaining_mah = (float)capacity + net_charge_mah;
+    socStats.current_soc_percent = (remaining_mah / (float)capacity) * 100.0f;
+
+    // Clamp
+    if (socStats.current_soc_percent > 100.0f)
+        socStats.current_soc_percent = 100.0f;
+    if (socStats.current_soc_percent < 0.0f)
+        socStats.current_soc_percent = 0.0f;
+}
+
+void InheroMr2Module::syncSOCToFull()
+{
+    if (!ina228Ok)
+        return;
+
+    // Reset INA228 hardware Coulomb counter (clears CHARGE + ENERGY registers)
+    ina228.resetCoulombCounter();
+
+    // Set baseline to 0 (counter was just reset)
+    socStats.ina228_baseline_mah = 0;
+
+    // Mark as fully charged
+    socStats.current_soc_percent = 100.0f;
+    socStats.soc_valid = true;
+}
+
+bool InheroMr2Module::setSOCManually(float soc_percent)
+{
+    if (!ina228Ok)
+        return false;
+    if (soc_percent < 0.0f || soc_percent > 100.0f)
+        return false;
+
+    uint32_t capacity = getEffectiveCapacity();
+    if (capacity == 0)
+        return false;
+
+    // Read current CHARGE register value
+    float current_charge_mah = ina228.readCharge_mAh();
+
+    // Calculate baseline so that: remaining = capacity + (charge - baseline)
+    // remaining = (soc/100) * capacity
+    // baseline = charge - (remaining - capacity)
+    float remaining_mah = (soc_percent / 100.0f) * (float)capacity;
+    socStats.ina228_baseline_mah = current_charge_mah - (remaining_mah - (float)capacity);
+
+    socStats.current_soc_percent = soc_percent;
+    socStats.soc_valid = true;
+    return true;
+}
+
+bool InheroMr2Module::isBatteryCharging() const
+{
+    if (!bq25798Ok)
+        return false;
+    // const_cast needed because getChargingStatus() is not const in the driver
+    bq_charging_status_t status = const_cast<BQ25798Driver &>(bq25798).getChargingStatus();
+    return (status >= BQ_CHARGE_TRICKLE && status <= BQ_CHARGE_DONE && status != BQ_CHARGE_NOT_CHARGING);
+}
+
+// ============================================================
+// Watchdog (nRF52 WDT, 600s timeout — ported from MeshCore)
+// ============================================================
+
+void InheroMr2Module::setupWatchdog()
+{
+#ifdef ARCH_NRF52
+    // 600s timeout (~10 minutes) — catches firmware hangs
+    // CRV = (timeout_seconds * 32768) - 1
+    NRF_WDT->CONFIG = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos) |
+                      (WDT_CONFIG_HALT_Pause << WDT_CONFIG_HALT_Pos);
+    NRF_WDT->CRV = 32768UL * 600UL - 1;
+    NRF_WDT->RREN = WDT_RREN_RR0_Msk; // Enable reload register 0
+    NRF_WDT->TASKS_START = 1;
+    wdtEnabled = true;
+    LOG_INFO("InheroMr2: WDT started (600s timeout)");
+#endif
+}
+
+void InheroMr2Module::feedWatchdog()
+{
+#ifdef ARCH_NRF52
+    if (wdtEnabled) {
+        NRF_WDT->RR[0] = WDT_RR_RR_Reload;
+    }
+#endif
+}
+
+// ============================================================
+// Danger Zone / Shutdown (ported from MeshCore)
+// ============================================================
+
+void InheroMr2Module::initiateShutdown(uint8_t reason)
+{
+#ifdef ARCH_NRF52
+    LOG_WARN("InheroMr2: Initiating shutdown (reason=%u)", reason);
+
+    // Power off the SX1262 radio to minimize current draw during sleep
+    #if defined(SX126X_POWER_EN)
+    digitalWrite(SX126X_POWER_EN, LOW);
+    delay(10);
+    #endif
+
+    // Configure RTC wake (6 hours default, 2 hours on low-voltage)
+    uint32_t wakeHours = (reason == SHUTDOWN_REASON_LOW_VOLTAGE) ? 2 : 6;
+    if (rtcOk) {
+        configureRTCWake(wakeHours);
+    }
+
+    // Store shutdown reason + danger-zone flag in GPREGRET2 (survives warm resets)
+    uint8_t regval = (reason & 0x03);
+    if (reason == SHUTDOWN_REASON_LOW_VOLTAGE)
+        regval |= GPREGRET2_IN_DANGER_ZONE;
+    sd_power_gpregret_clr(1, 0xFF);  // GPREGRET2 = index 1
+    sd_power_gpregret_set(1, regval);
+
+    // Halt
+    sd_power_system_off();
+    // Does not return — wakes via RTC interrupt or button
+#endif
+}
+
+void InheroMr2Module::configureRTCWake(uint32_t hours)
+{
+    if (!rtcOk || hours == 0)
+        return;
+
+    // RV-3028 I2C address 0x52
+    // Countdown Timer configuration:
+    //   0x0A-0x0B: Timer Value (16-bit, little-endian)
+    //   0x0E: Status Register — clear timer flag (bit 3 = TF)
+    //   0x0F: Control 1 — enable countdown timer interrupt (bit 1 = TIE)
+    //   0x10: Control 2 — timer clock 1/60 Hz (bits 1:0 = 10), enable timer (bit 2 = TE)
+
+    Wire.beginTransmission(0x52);
+    Wire.write(0x0A);
+    // Timer value = hours * 60 minutes (1/60 Hz clock = 1 tick per minute)
+    uint16_t timerVal = (uint16_t)(hours * 60);
+    Wire.write((uint8_t)(timerVal & 0xFF));        // Timer Value Low
+    Wire.write((uint8_t)((timerVal >> 8) & 0xFF)); // Timer Value High
+    Wire.endTransmission();
+
+    // Clear timer flag in Status Register
+    Wire.beginTransmission(0x52);
+    Wire.write(0x0E);
+    Wire.write(0x00); // Clear all status flags
+    Wire.endTransmission();
+
+    // Control 1: Enable Timer Interrupt (TIE = bit 1)
+    Wire.beginTransmission(0x52);
+    Wire.write(0x0F);
+    Wire.write(0x02); // TIE = 1
+    Wire.endTransmission();
+
+    // Control 2: Timer Enable + 1/60 Hz clock
+    // TE = bit 2, TD[1:0] = bits 1:0 (10 = 1/60 Hz)
+    Wire.beginTransmission(0x52);
+    Wire.write(0x10);
+    Wire.write(0x06); // TE=1, TD=10b (1/60 Hz)
+    Wire.endTransmission();
+
+    LOG_INFO("InheroMr2: RTC wake configured for %u hours (%u minutes)", hours, timerVal);
+}
+
+// ============================================================
+// Solar MPPT Management (ported from MeshCore)
+// ============================================================
+
+void InheroMr2Module::checkAndFixPgoodStuck()
+{
+    if (!bq25798Ok || !solarData)
+        return;
+
+    // Problem: VBUS present (solar panel connected) but PGOOD is low
+    // BQ25798 can get stuck where it doesn't recognize the input.
+    // Solution: Toggle HIZ mode to force input re-detection.
+
+    bool pgood = bq25798.getChargerStatusPowerGood();
+    uint16_t vbus_mv = solarData->solar.voltage;
+
+    if (!pgood && vbus_mv > MIN_VBUS_FOR_CHARGING) {
+        // Check PG_FLAG to see if BQ has detected any input event
+        bool pgFlag = bq25798.checkAndClearPgFlag();
+        if (!pgFlag) {
+            // No PG event at all — genuinely stuck. Toggle HIZ with cooldown.
+            uint32_t now = millis();
+            if (now - lastHizToggleTime >= HIZ_TOGGLE_COOLDOWN_MS) {
+                lastHizToggleTime = now;
+                LOG_WARN("InheroMr2: PGOOD stuck (VBUS=%.2fV, PG=0, no PG_FLAG) — toggling HIZ", vbus_mv / 1000.0f);
+                bq25798.setHIZMode(true);
+                delay(200);
+                bq25798.setHIZMode(false);
+            }
+        }
+    }
+}
+
+void InheroMr2Module::checkAndFixSolarLogic()
+{
+    if (!bq25798Ok)
+        return;
+
+    // When PGOOD=1 (solar is connected), ensure MPPT is actually enabled.
+    // BQ25798 can sometimes disable MPPT after certain fault events.
+
+    bool pgood = bq25798.getChargerStatusPowerGood();
+    if (!pgood || !boardConfig.mpptEnabled)
+        return;
+
+    bool mpptCurrentlyEnabled = bq25798.getMPPTenable();
+    if (!mpptCurrentlyEnabled) {
+        uint32_t now = millis();
+        if (now - lastMpptWriteTime >= MPPT_WRITE_COOLDOWN_MS) {
+            lastMpptWriteTime = now;
+            bq25798.setMPPTenable(true);
+            LOG_WARN("InheroMr2: Re-enabled MPPT (was disabled while PG=1)");
+        }
+    }
+}
+
+// ============================================================
+// Energy Analytics — Hourly Stats (ported from MeshCore)
+// ============================================================
+
+void InheroMr2Module::updateHourlyStats()
+{
+    uint32_t now = getTime();
+    if (now == 0)
+        now = millis() / 1000; // Fallback if no RTC/GPS time
+
+    // Check if we've crossed an hour boundary
+    if (socStats.lastHourUpdateTime == 0) {
+        socStats.lastHourUpdateTime = now;
+        return;
+    }
+
+    uint32_t elapsed = now - socStats.lastHourUpdateTime;
+    if (elapsed < 3600)
+        return; // Not yet 1 hour
+
+    // Save current hour's data to the rolling buffer
+    HourlyBatteryStats &slot = socStats.hours[socStats.currentIndex];
+    slot.timestamp = socStats.lastHourUpdateTime;
+    slot.charged_mah = socStats.current_hour_charged_mah;
+    slot.discharged_mah = socStats.current_hour_discharged_mah;
+    slot.solar_mah = socStats.current_hour_solar_mah;
+
+    // Advance index (circular buffer)
+    socStats.currentIndex = (socStats.currentIndex + 1) % HOURLY_STATS_HOURS;
+
+    // Reset accumulators for next hour
+    socStats.current_hour_charged_mah = 0;
+    socStats.current_hour_discharged_mah = 0;
+    socStats.current_hour_solar_mah = 0;
+    socStats.lastHourUpdateTime = now;
+
+    // Recalculate rolling statistics from buffer
+    calculateRollingStats();
+    calculateTTL();
+
+    LOG_DEBUG("InheroMr2: Hourly stats updated (idx=%u, 24h_net=%.0fmAh, TTL=%uh)",
+              socStats.currentIndex, socStats.last_24h_net_mah, socStats.ttl_hours);
+}
+
+void InheroMr2Module::calculateRollingStats()
+{
+    // Calculate 24h, 3-day, and 7-day rolling averages from the circular buffer
+    float charged_24h = 0, discharged_24h = 0;
+    float charged_3d = 0, discharged_3d = 0;
+    float charged_7d = 0, discharged_7d = 0;
+    uint16_t count_24h = 0, count_3d = 0, count_7d = 0;
+
+    for (int i = 0; i < HOURLY_STATS_HOURS; i++) {
+        const HourlyBatteryStats &h = socStats.hours[i];
+        if (h.timestamp == 0)
+            continue; // Empty slot
+
+        count_7d++;
+        charged_7d += h.charged_mah;
+        discharged_7d += h.discharged_mah;
+
+        // 3-day window = 72 hours
+        // Use index distance in circular buffer
+        int dist = (socStats.currentIndex - 1 - i + HOURLY_STATS_HOURS) % HOURLY_STATS_HOURS;
+        if (dist < 72) {
+            count_3d++;
+            charged_3d += h.charged_mah;
+            discharged_3d += h.discharged_mah;
+        }
+        if (dist < 24) {
+            count_24h++;
+            charged_24h += h.charged_mah;
+            discharged_24h += h.discharged_mah;
+        }
+    }
+
+    // 24h totals
+    socStats.last_24h_charged_mah = charged_24h;
+    socStats.last_24h_discharged_mah = discharged_24h;
+    socStats.last_24h_net_mah = charged_24h - discharged_24h;
+
+    // 3-day daily averages
+    float days_3d = (count_3d > 0) ? (count_3d / 24.0f) : 0;
+    if (days_3d > 0) {
+        socStats.avg_3day_daily_charged_mah = charged_3d / days_3d;
+        socStats.avg_3day_daily_discharged_mah = discharged_3d / days_3d;
+        socStats.avg_3day_daily_net_mah = (charged_3d - discharged_3d) / days_3d;
+    }
+
+    // 7-day daily averages
+    float days_7d = (count_7d > 0) ? (count_7d / 24.0f) : 0;
+    if (days_7d > 0) {
+        socStats.avg_7day_daily_charged_mah = charged_7d / days_7d;
+        socStats.avg_7day_daily_discharged_mah = discharged_7d / days_7d;
+        socStats.avg_7day_daily_net_mah = (charged_7d - discharged_7d) / days_7d;
+    }
+
+    socStats.living_on_battery = (socStats.last_24h_net_mah < 0);
+}
+
+void InheroMr2Module::calculateTTL()
+{
+    // TTL = remaining_mah / daily_deficit
+    // Only meaningful when consuming more than charging (net < 0)
+
+    if (!socStats.soc_valid || socStats.capacity_mah <= 0) {
+        socStats.ttl_hours = 0;
+        return;
+    }
+
+    // Use 3-day average if available, otherwise 24h
+    float daily_net = socStats.avg_3day_daily_net_mah;
+    if (daily_net == 0 && socStats.last_24h_net_mah != 0) {
+        daily_net = socStats.last_24h_net_mah;
+    }
+
+    if (daily_net >= 0) {
+        // Net positive or zero — battery gaining charge, TTL=∞
+        socStats.ttl_hours = 0xFFFF; // Effectively infinite
+        return;
+    }
+
+    float remaining_mah = (socStats.current_soc_percent / 100.0f) * socStats.capacity_mah;
+    float hourly_deficit = (-daily_net) / 24.0f; // Convert daily to hourly (positive number)
+
+    if (hourly_deficit < 0.01f) {
+        socStats.ttl_hours = 0xFFFF;
+        return;
+    }
+
+    uint32_t ttl = (uint32_t)(remaining_mah / hourly_deficit);
+    socStats.ttl_hours = (ttl > 0xFFFE) ? 0xFFFE : (uint16_t)ttl;
+}
+
+// ============================================================
+// MPPT Statistics (ported from MeshCore)
+// ============================================================
+
+void InheroMr2Module::updateMpptStats()
+{
+    if (!bq25798Ok)
+        return;
+
+    uint32_t now = getTime();
+    if (now == 0)
+        now = millis() / 1000;
+
+    // Track whether MPPT is currently enabled
+    bool mpptNow = bq25798.getMPPTenable() && bq25798.getChargerStatusPowerGood();
+
+    if (!mpptStatsInitialized) {
+        mpptStats.lastUpdateTime = now;
+        mpptStats.usingRTC = (getTime() != 0);
+        mpptStatsInitialized = true;
+        lastMpptStatus = mpptNow;
+        return;
+    }
+
+    // Accumulate minutes MPPT was enabled
+    // runOnce() is called every 10s, so each call ≈ 10s/60 ≈ 0.167 minutes
+    // We track as integer minutes — increment every 6 calls (~60s)
+    if (mpptNow && lastMpptStatus) {
+        // Both previous and current reading show MPPT active: count this interval
+        mpptStats.currentHourMinutes++;
+    }
+    lastMpptStatus = mpptNow;
+
+    // Accumulate energy (solar power * time)
+    if (solarData && mpptNow) {
+        int32_t power_mW = (int32_t)solarData->solar.voltage * solarData->solar.current / 1000;
+        // Each interval is ~10s, energy = power * time (mWh) = power_mW * 10 / 3600000
+        mpptStats.currentHourEnergy_mWh += (uint32_t)(power_mW * 10UL / 3600UL);
+    }
+
+    // Check hour boundary
+    uint32_t elapsed = now - mpptStats.lastUpdateTime;
+    if (elapsed >= 3600) {
+        // Save to circular buffer
+        MpptHourlyStats &slot = mpptStats.hours[mpptStats.currentIndex];
+        slot.mpptEnabledMinutes = (uint8_t)min((uint16_t)60, mpptStats.currentHourMinutes);
+        slot.timestamp = mpptStats.lastUpdateTime;
+        slot.harvestedEnergy_mWh = mpptStats.currentHourEnergy_mWh;
+
+        mpptStats.currentIndex = (mpptStats.currentIndex + 1) % MPPT_STATS_HOURS;
+        mpptStats.currentHourMinutes = 0;
+        mpptStats.currentHourEnergy_mWh = 0;
+        mpptStats.lastUpdateTime = now;
+    }
+}
+
+float InheroMr2Module::getMpptEnabledPercentage7Day()
+{
+    uint32_t totalMinutes = 0;
+    uint32_t totalSlots = 0;
+
+    for (int i = 0; i < MPPT_STATS_HOURS; i++) {
+        if (mpptStats.hours[i].timestamp == 0)
+            continue;
+        totalMinutes += mpptStats.hours[i].mpptEnabledMinutes;
+        totalSlots++;
+    }
+
+    if (totalSlots == 0)
+        return 0.0f;
+
+    // Perfect = 60 minutes per slot
+    return (totalMinutes / (totalSlots * 60.0f)) * 100.0f;
 }
 
 // === Config Persistence (LittleFS) ===
@@ -877,6 +1551,11 @@ void InheroMr2Module::loadConfig()
 
 void InheroMr2Module::saveConfig()
 {
+    if (skipFsWrites) {
+        LOG_WARN("InheroMr2: saveConfig() skipped (low-voltage boot, skipFsWrites=true)");
+        return;
+    }
+
     writeConfigValue("bat", chemistryToString(boardConfig.chemistry));
 
     char buf[32];
