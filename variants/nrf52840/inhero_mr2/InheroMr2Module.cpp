@@ -227,6 +227,10 @@ ProcessMessage InheroMr2Module::handleReceived(const meshtastic_MeshPacket &mp)
     cmd++;
 
     LOG_INFO("InheroMr2: CLI command from 0x%08x: /%s", mp.from, cmd);
+
+    // Flash LED2 briefly to indicate CLI activity
+    cliFlashUntil = millis() + 200;
+
     handleCliCommand(mp, cmd);
 
     // CONTINUE so TextMessageModule still stores/displays the command in chat history
@@ -766,23 +770,35 @@ void InheroMr2Module::applyChemistryConfig()
 void InheroMr2Module::updateLEDs()
 {
     if (!boardConfig.ledsEnabled) {
-        // Turn off both LEDs
         ledOff(PIN_LED1);
         ledOff(PIN_LED2);
         return;
     }
 
-    // Blue LED: normal operation heartbeat (blink briefly)
-    // Red LED: charging indicator
-    if (bq25798Ok) {
-        bq_charging_status_t status = bq25798.getChargingStatus();
-        if (status >= BQ_CHARGE_CC && status <= BQ_CHARGE_CV) {
-            ledOn(PIN_LED2); // Red = charging
-        } else if (status == BQ_CHARGE_DONE) {
-            ledOff(PIN_LED2); // Charge complete
+    // === LED2 (Red) — Priority-based status indicator ===
+    //
+    // Priority 1: DANGER VOLTAGE — 100ms flash every 3s (battery critically low, conserve power)
+    // Priority 2: CLI COMMAND    — 200ms flash (remote admin activity)
+    // Priority 3: OFF            — normal operation (BQ25798 STAT-LED handles charging)
+
+    const ChemistryParams &params = getChemistryParams(boardConfig.chemistry);
+    bool dangerVoltage = ina228Ok && batteryData.voltage_mv > 0 &&
+                         batteryData.voltage_mv < params.dangerVoltage_mV;
+
+    if (dangerVoltage) {
+        // P1: Short blink every 3s — battery in danger zone (conserve power)
+        uint32_t phase = millis() % 3000;
+        if (phase < 100) {
+            ledOn(PIN_LED2);
         } else {
             ledOff(PIN_LED2);
         }
+    } else if (millis() < cliFlashUntil) {
+        // P2: Brief flash — CLI command was processed
+        ledOn(PIN_LED2);
+    } else {
+        // P3: Off — BQ25798 hardware STAT-LED shows charging state
+        ledOff(PIN_LED2);
     }
 }
 

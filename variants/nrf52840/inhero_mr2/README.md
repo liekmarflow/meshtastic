@@ -454,9 +454,17 @@ Legacy-Werte (`lifepo4`, `liion`) werden beim Laden automatisch auf die MeshCore
 | LED | Pin | Funktion |
 |---|---|---|
 | **Blau** (PIN_LED1 = 35) | P1.03 | Status (von Meshtastic verwaltet) |
-| **Rot** (PIN_LED2 = 36) | P1.04 | Ladeanzeige (CC/CV = AN, Done = AUS) |
+| **Rot** (PIN_LED2 = 36) | P1.04 | Prioritätsbasierte Statusanzeige (siehe unten) |
 
-LEDs können per `set leds 0` komplett deaktiviert werden (Stromsparen).
+**LED2 (Rot) – Prioritätslogik:**
+
+| Priorität | Zustand | Bedeutung |
+|---|---|---|
+| 1 (höchste) | **100ms Blitz alle 3s** | Batterie unter Danger-Schwelle (stromsparend) |
+| 2 | **200ms Blitz** | CLI-Befehl empfangen und verarbeitet |
+| 3 (Standard) | **AUS** | Normalbetrieb – BQ25798 STAT-LED zeigt Ladezustand |
+
+LEDs können per `/set leds 0` komplett deaktiviert werden (Stromsparen).
 
 ---
 

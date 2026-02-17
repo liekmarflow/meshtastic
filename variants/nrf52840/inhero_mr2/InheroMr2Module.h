@@ -116,6 +116,9 @@ class InheroMr2Module : private concurrency::OSThread, public SinglePortModule
     Ina228BatteryData batteryData = {0};
     const BqTelemetry *solarData = nullptr;
 
+    // LED2 (Red) state: CLI flash timing
+    uint32_t cliFlashUntil = 0; // millis() when CLI flash should end (200ms pulse)
+
     // === CLI Command Handling ===
 
     /// Check if the sender is an authorized remote admin (pubkey in config.security.admin_key[])
