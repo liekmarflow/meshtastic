@@ -9,10 +9,23 @@
  * - INA228 battery monitoring (ch1 in PowerTelemetry)
  * - BQ25798 solar charger management (ch2 in PowerTelemetry)
  * - Battery chemistry configuration (LTO/LiFePO4/Li-Ion)
- * - Board config via PortNum 256 (PRIVATE_APP) text protocol
+ * - MeshCore-compatible CLI via text message DMs (/get, /set, /help)
+ * - Admin authentication via config.security.admin_key pubkeys
  * - LittleFS persistent config storage
  * - Early boot voltage check (anti-motorboating)
  * - LED control
+ *
+ * CLI Commands (via DM text messages):
+ *   /get board.<key>    - Read board configuration/telemetry
+ *   /set board.<key> <v> - Write board configuration (requires admin key)
+ *   /help               - List available commands
+ *   /ver                - Firmware version
+ *   /reboot             - Reboot node (requires admin key)
+ *
+ * Authentication:
+ *   Write commands require the sender's public key to be registered in
+ *   config.security.admin_key[0..2]. PKI-encrypted DMs use the cryptographically
+ *   verified sender key; channel-encrypted DMs fall back to NodeDB lookup.
  */
 
 #pragma once
@@ -51,7 +64,10 @@ struct InheroMr2Config {
     bool mpptEnabled = true;
     bool ledsEnabled = true;
     float inaCalibration = 1.0f;
+    float tcCalOffset = 0.0f;
     bool frostProtect = true;
+    bool uvloEnabled = true;
+    uint32_t batteryCapacity_mAh = 0; // 0 = use chemistry default
 };
 
 class InheroMr2Module : private concurrency::OSThread, public SinglePortModule
@@ -68,11 +84,14 @@ class InheroMr2Module : private concurrency::OSThread, public SinglePortModule
     /// Get the singleton instance
     static InheroMr2Module *getInstance() { return instance; }
 
+    /// Override wantPacket to receive TEXT_MESSAGE_APP packets addressed to us
+    virtual bool wantPacket(const meshtastic_MeshPacket *p) override;
+
   protected:
     /// Periodic task - reads sensors, sends telemetry, monitors voltage
     virtual int32_t runOnce() override;
 
-    /// Handle incoming config commands on PortNum 256
+    /// Handle incoming text messages, intercept /commands
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
 
   private:
@@ -97,23 +116,38 @@ class InheroMr2Module : private concurrency::OSThread, public SinglePortModule
     Ina228BatteryData batteryData = {0};
     const BqTelemetry *solarData = nullptr;
 
-    // Config persistence
-    void loadConfig();
-    void saveConfig();
+    // === CLI Command Handling ===
 
-    // Telemetry
-    void sendPowerTelemetry();
+    /// Check if the sender is an authorized remote admin (pubkey in config.security.admin_key[])
+    bool isAuthorizedAdmin(const meshtastic_MeshPacket &mp);
 
-    // Config command handling
-    void handleConfigCommand(const meshtastic_MeshPacket &mp, const char *payload, size_t len);
+    /// Main CLI dispatcher — parses /get, /set, /help, /ver, /reboot
+    void handleCliCommand(const meshtastic_MeshPacket &mp, const char *cmd);
+
+    /// Handle /get board.<key> commands (MeshCore getCustomGetter compatible)
+    void handleGetCommand(const meshtastic_MeshPacket &mp, const char *key);
+
+    /// Handle /set board.<key> <value> commands (MeshCore setCustomSetter compatible)
+    void handleSetCommand(const meshtastic_MeshPacket &mp, const char *keyAndValue);
+
+    /// Send a text message reply to sender on TEXT_MESSAGE_APP
     void sendTextReply(const meshtastic_MeshPacket &mp, const char *text);
 
-    // Charger management
+    // === Telemetry ===
+    void sendPowerTelemetry();
+
+    // === Charger Management ===
     void applyChemistryConfig();
     void updateLEDs();
     int estimateSOC();
 
-    // Config persistence helpers
+    // === Helper: battery type string conversion ===
+    static const char *chemistryToString(BatteryChemistry chem);
+    static BatteryChemistry stringToChemistry(const char *str);
+
+    // === Config Persistence (LittleFS) ===
+    void loadConfig();
+    void saveConfig();
     void writeConfigValue(const char *key, const char *value);
     size_t readConfigValue(const char *key, char *buffer, size_t maxLen, const char *defaultValue = "");
 };

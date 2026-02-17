@@ -4,7 +4,11 @@
  * SPDX-License-Identifier: MIT
  *
  * Inhero MR-2 Board Module - Implementation
- * Ported from MeshCore BoardConfigContainer + InheroMr2Board to Meshtastic
+ * MeshCore-compatible CLI via Meshtastic text message DMs.
+ *
+ * Commands are received as normal text messages (DMs) starting with '/'.
+ * Write operations require the sender's public key to be registered in
+ * config.security.admin_key[0..2] (same mechanism as Meshtastic AdminModule).
  */
 
 #include "InheroMr2Module.h"
@@ -15,6 +19,7 @@
 #include "main.h"
 #include "mesh/generated/meshtastic/telemetry.pb.h"
 #include <pb_encode.h>
+#include <cctype>
 
 InheroMr2Module *InheroMr2Module::instance = nullptr;
 
@@ -30,12 +35,22 @@ static const ChemistryParams chemistryTable[] = {
     {3500, 2900, 3200, 3400, 2950},
 };
 
+// Default battery capacities per chemistry (mAh)
+static const uint32_t defaultBatteryCapacity[] = {
+    3000, // LTO_2S
+    3000, // LiFePO4_1S
+    3000, // Li_Ion_1S
+    3000, // BAT_UNKNOWN
+};
+
 InheroMr2Module::InheroMr2Module()
     : concurrency::OSThread("InheroMr2"),
-      SinglePortModule("InheroMr2", meshtastic_PortNum_PRIVATE_APP),
+      SinglePortModule("InheroMr2", meshtastic_PortNum_TEXT_MESSAGE_APP),
       ina228(INA228_I2C_ADDR_DEFAULT)
 {
     instance = this;
+    // Receive DMs addressed to this node + broadcast (like ReplyBotModule)
+    isPromiscuous = true;
     // Allow receiving from localhost (so config commands from serial/BLE work)
     loopbackOk = true;
 }
@@ -170,155 +185,543 @@ void InheroMr2Module::sendPowerTelemetry()
     service->sendToMesh(p, RX_SRC_LOCAL, true);
 }
 
-// === Config Command Handling ===
+// === CLI Command Handling via Text Message DMs ===
+
+bool InheroMr2Module::wantPacket(const meshtastic_MeshPacket *p)
+{
+    // Accept TEXT_MESSAGE_APP packets (same port as TextMessageModule/ReplyBotModule)
+    return (p && p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP);
+}
 
 ProcessMessage InheroMr2Module::handleReceived(const meshtastic_MeshPacket &mp)
 {
-    if (mp.decoded.portnum != meshtastic_PortNum_PRIVATE_APP) {
+    // Only process DMs addressed to this node (not broadcasts)
+    if (mp.to != nodeDB->getNodeNum() && mp.from != 0) {
         return ProcessMessage::CONTINUE;
     }
 
     // Extract text payload
-    const char *payload = (const char *)mp.decoded.payload.bytes;
-    size_t len = mp.decoded.payload.size;
-
-    if (len == 0 || len > 200) {
+    if (mp.decoded.payload.size == 0 || mp.decoded.payload.size > 250) {
         return ProcessMessage::CONTINUE;
     }
 
-    handleConfigCommand(mp, payload, len);
-    return ProcessMessage::STOP;
+    // Null-terminate the payload
+    char buf[260];
+    size_t n = mp.decoded.payload.size;
+    if (n > sizeof(buf) - 1)
+        n = sizeof(buf) - 1;
+    memcpy(buf, mp.decoded.payload.bytes, n);
+    buf[n] = '\0';
+
+    // Skip leading whitespace
+    char *cmd = buf;
+    while (*cmd == ' ' || *cmd == '\t')
+        cmd++;
+
+    // Only intercept commands starting with '/'
+    if (cmd[0] != '/') {
+        return ProcessMessage::CONTINUE;
+    }
+
+    // Skip the '/' prefix
+    cmd++;
+
+    LOG_INFO("InheroMr2: CLI command from 0x%08x: /%s", mp.from, cmd);
+    handleCliCommand(mp, cmd);
+
+    // CONTINUE so TextMessageModule still stores/displays the command in chat history
+    return ProcessMessage::CONTINUE;
 }
 
-void InheroMr2Module::handleConfigCommand(const meshtastic_MeshPacket &mp, const char *payload, size_t len)
+/// Check if sender's public key matches one of config.security.admin_key[0..2]
+/// Only accepts PKI-encrypted DMs or local (serial/BLE) connections.
+/// Channel-encrypted DMs are rejected because mp.from is not cryptographically bound.
+bool InheroMr2Module::isAuthorizedAdmin(const meshtastic_MeshPacket &mp)
 {
-    // Make a null-terminated copy
-    char cmd[201];
-    size_t copyLen = (len < 200) ? len : 200;
-    memcpy(cmd, payload, copyLen);
-    cmd[copyLen] = '\0';
+    // Local messages (serial/BLE connected) are always trusted
+    if (mp.from == 0) {
+        return true;
+    }
 
-    char response[256] = {0};
+    // Reject non-PKI messages — channel-encrypted DMs have no cryptographic sender proof
+    if (!mp.pki_encrypted) {
+        LOG_WARN("InheroMr2: Rejecting non-PKI admin attempt from 0x%08x (channel-encrypted DMs not accepted)", mp.from);
+        return false;
+    }
 
-    // Parse command
-    if (strncmp(cmd, "get status", 10) == 0) {
-        // Return all sensor data
-        snprintf(response, sizeof(response), "v=%u i=%d p=%d t=%.1f sv=%u si=%d sp=%d bt=%.1f sys=%u soc=%d", batteryData.voltage_mv,
-                 batteryData.current_ma, batteryData.power_mw, batteryData.die_temp_c,
-                 solarData ? solarData->solar.voltage : 0, solarData ? solarData->solar.current : 0,
-                 solarData ? solarData->solar.power : 0, solarData ? solarData->battery.temperature : -999.0f,
-                 solarData ? solarData->system.voltage : 0, estimateSOC());
+    // PKI-encrypted: sender key is cryptographically verified via ECDH
+    if (mp.public_key.size != 32) {
+        LOG_WARN("InheroMr2: PKI message from 0x%08x has no valid public key", mp.from);
+        return false;
+    }
 
-    } else if (strncmp(cmd, "get config", 10) == 0) {
-        const char *chemStr = "unknown";
-        switch (boardConfig.chemistry) {
-        case BatteryChemistry::LTO_2S:
-            chemStr = "lto2s";
-            break;
-        case BatteryChemistry::LiFePO4_1S:
-            chemStr = "lifepo4";
-            break;
-        case BatteryChemistry::Li_Ion_1S:
-            chemStr = "liion";
-            break;
-        default:
-            break;
+    // Compare against all configured admin keys (same logic as AdminModule)
+    for (int i = 0; i < 3; i++) {
+        if (config.security.admin_key[i].size == 32 &&
+            memcmp(mp.public_key.bytes, config.security.admin_key[i].bytes, 32) == 0) {
+            LOG_INFO("InheroMr2: Admin key match (slot %d) for 0x%08x", i, mp.from);
+            return true;
         }
-        snprintf(response, sizeof(response), "bat=%s imax=%u mppt=%u leds=%u frost=%u cal=%.4f", chemStr,
-                 boardConfig.chargeCurrentMax_mA, boardConfig.mpptEnabled ? 1 : 0, boardConfig.ledsEnabled ? 1 : 0,
-                 boardConfig.frostProtect ? 1 : 0, boardConfig.inaCalibration);
+    }
 
-    } else if (strncmp(cmd, "set bat ", 8) == 0) {
-        const char *val = cmd + 8;
-        if (strcmp(val, "lto2s") == 0)
-            boardConfig.chemistry = BatteryChemistry::LTO_2S;
-        else if (strcmp(val, "lifepo4") == 0)
-            boardConfig.chemistry = BatteryChemistry::LiFePO4_1S;
-        else if (strcmp(val, "liion") == 0)
-            boardConfig.chemistry = BatteryChemistry::Li_Ion_1S;
-        else {
-            snprintf(response, sizeof(response), "err: unknown battery type '%s' (lto2s|lifepo4|liion)", val);
-            sendTextReply(mp, response);
+    LOG_WARN("InheroMr2: Unauthorized admin attempt from 0x%08x", mp.from);
+    return false;
+}
+
+/// Main CLI dispatcher
+void InheroMr2Module::handleCliCommand(const meshtastic_MeshPacket &mp, const char *cmd)
+{
+    // Skip leading whitespace after '/'
+    while (*cmd == ' ' || *cmd == '\t')
+        cmd++;
+
+    if (strncmp(cmd, "get ", 4) == 0) {
+        // /get commands — read-only, but still require admin for security
+        const char *key = cmd + 4;
+        while (*key == ' ')
+            key++;
+
+        if (strncmp(key, "board.", 6) == 0) {
+            handleGetCommand(mp, key + 6);
+        } else {
+            sendTextReply(mp, "Err: Try /get board.<key> (bat|telem|conf|diag|hwver|frost|imax|mppt|leds|uvlo|ibcal|tccal|batcap|energy)");
+        }
+
+    } else if (strncmp(cmd, "set ", 4) == 0) {
+        // /set commands — require admin authorization
+        if (!isAuthorizedAdmin(mp)) {
+            sendTextReply(mp, "Err: Not authorized. Requires PKI-encrypted DM with admin_key.");
             return;
         }
-        saveConfig();
-        applyChemistryConfig();
-        snprintf(response, sizeof(response), "ok bat=%s", val);
 
-    } else if (strncmp(cmd, "set imax ", 9) == 0) {
-        int val = atoi(cmd + 9);
-        if (val >= 50 && val <= 2000) {
-            boardConfig.chargeCurrentMax_mA = (uint16_t)val;
-            saveConfig();
-            if (bq25798Ok)
-                bq25798.setChargeLimitA(boardConfig.chargeCurrentMax_mA / 1000.0f);
-            snprintf(response, sizeof(response), "ok imax=%u", boardConfig.chargeCurrentMax_mA);
+        const char *keyAndValue = cmd + 4;
+        while (*keyAndValue == ' ')
+            keyAndValue++;
+
+        if (strncmp(keyAndValue, "board.", 6) == 0) {
+            handleSetCommand(mp, keyAndValue + 6);
         } else {
-            snprintf(response, sizeof(response), "err: imax out of range (50-2000)");
+            sendTextReply(mp, "Err: Try /set board.<key> <value> (bat|imax|frost|mppt|leds|uvlo|ibcal|tccal|batcap|bqreset|soc)");
         }
 
-    } else if (strncmp(cmd, "set mppt ", 9) == 0) {
-        boardConfig.mpptEnabled = (cmd[9] == '1');
-        saveConfig();
-        if (bq25798Ok)
-            bq25798.setMPPTenable(boardConfig.mpptEnabled);
-        snprintf(response, sizeof(response), "ok mppt=%u", boardConfig.mpptEnabled ? 1 : 0);
+    } else if (strncmp(cmd, "reboot", 6) == 0) {
+        if (!isAuthorizedAdmin(mp)) {
+            sendTextReply(mp, "Err: Not authorized");
+            return;
+        }
+        sendTextReply(mp, "Rebooting in 2s...");
+        rebootAtMsec = millis() + 2000;
 
-    } else if (strncmp(cmd, "set leds ", 9) == 0) {
-        boardConfig.ledsEnabled = (cmd[9] == '1');
-        saveConfig();
-        updateLEDs();
-        snprintf(response, sizeof(response), "ok leds=%u", boardConfig.ledsEnabled ? 1 : 0);
+    } else if (strncmp(cmd, "ver", 3) == 0) {
+        char response[128];
+        snprintf(response, sizeof(response), "Inhero MR-2 | Meshtastic %s", optstr(APP_VERSION));
+        sendTextReply(mp, response);
 
-    } else if (strncmp(cmd, "set frost ", 10) == 0) {
-        boardConfig.frostProtect = (cmd[10] == '1');
-        saveConfig();
-        applyChemistryConfig();
-        snprintf(response, sizeof(response), "ok frost=%u", boardConfig.frostProtect ? 1 : 0);
+    } else if (strncmp(cmd, "help", 4) == 0) {
+        // Send help in multiple messages to avoid payload limit
+        sendTextReply(mp,
+            "/get board.<key>\n"
+            "  bat telem conf diag hwver frost imax mppt leds uvlo ibcal tccal batcap energy\n"
+            "/set board.<key> <value> [admin]\n"
+            "  bat <lto2s|lifepo1s|liion1s>\n"
+            "  imax <10-1000> frost <0|1> mppt <0|1>\n"
+            "  leds <on|off> uvlo <0|1> soc <0-100>\n"
+            "  batcap <100-100000> ibcal <mA|reset>\n"
+            "  tccal [temp|reset] bqreset\n"
+            "/ver /reboot [admin] /help");
 
-    } else if (strncmp(cmd, "set cal ", 8) == 0) {
-        float val = atof(cmd + 8);
-        if (val >= 0.5f && val <= 2.0f) {
-            boardConfig.inaCalibration = val;
-            saveConfig();
-            if (ina228Ok)
-                ina228.setCalibrationFactor(val);
-            snprintf(response, sizeof(response), "ok cal=%.4f", boardConfig.inaCalibration);
+    } else {
+        sendTextReply(mp, "Err: Unknown command. Try /help");
+    }
+}
+
+// ============================================================
+// /get board.<key> — MeshCore getCustomGetter compatible
+// ============================================================
+
+void InheroMr2Module::handleGetCommand(const meshtastic_MeshPacket &mp, const char *key)
+{
+    char response[256] = {0};
+
+    // Trim trailing whitespace
+    char trimmed[64];
+    strncpy(trimmed, key, sizeof(trimmed) - 1);
+    trimmed[sizeof(trimmed) - 1] = '\0';
+    size_t len = strlen(trimmed);
+    while (len > 0 && (trimmed[len - 1] == ' ' || trimmed[len - 1] == '\n' || trimmed[len - 1] == '\r')) {
+        trimmed[--len] = '\0';
+    }
+
+    if (strcmp(trimmed, "bat") == 0) {
+        snprintf(response, sizeof(response), "%s", chemistryToString(boardConfig.chemistry));
+
+    } else if (strcmp(trimmed, "hwver") == 0) {
+        snprintf(response, sizeof(response), "v0.2 (INA228+RTC)");
+
+    } else if (strcmp(trimmed, "frost") == 0) {
+        if (boardConfig.chemistry == BatteryChemistry::LTO_2S) {
+            snprintf(response, sizeof(response), "N/A (LTO ignores JEITA)");
         } else {
-            snprintf(response, sizeof(response), "err: cal out of range (0.5-2.0)");
+            snprintf(response, sizeof(response), "frost=%s", boardConfig.frostProtect ? "on" : "off");
         }
 
-    } else if (strncmp(cmd, "get diag", 8) == 0) {
+    } else if (strcmp(trimmed, "imax") == 0) {
+        snprintf(response, sizeof(response), "%umA", boardConfig.chargeCurrentMax_mA);
+
+    } else if (strcmp(trimmed, "mppt") == 0) {
+        snprintf(response, sizeof(response), "MPPT=%s", boardConfig.mpptEnabled ? "1" : "0");
+
+    } else if (strcmp(trimmed, "telem") == 0) {
+        // Real-time telemetry: VBAT, IBAT, SOC, VSOL, ISOL (MeshCore format)
+        int soc = estimateSOC();
+        if (ina228Ok && bq25798Ok && solarData) {
+            char batCurStr[16], solCurStr[16];
+            snprintf(batCurStr, sizeof(batCurStr), "%.1fmA", batteryData.current_ma);
+            snprintf(solCurStr, sizeof(solCurStr), "~%.0fmA", (float)solarData->solar.current);
+
+            if (soc >= 0) {
+                snprintf(response, sizeof(response), "B:%.2fV/%s/%.0fC SOC:%d%% S:%.2fV/%s",
+                         batteryData.voltage_mv / 1000.0f, batCurStr, batteryData.die_temp_c,
+                         soc, solarData->solar.voltage / 1000.0f, solCurStr);
+            } else {
+                snprintf(response, sizeof(response), "B:%.2fV/%s/%.0fC SOC:N/A S:%.2fV/%s",
+                         batteryData.voltage_mv / 1000.0f, batCurStr, batteryData.die_temp_c,
+                         solarData->solar.voltage / 1000.0f, solCurStr);
+            }
+        } else if (ina228Ok) {
+            snprintf(response, sizeof(response), "B:%.2fV/%.1fmA/%.0fC SOC:%s S:N/A",
+                     batteryData.voltage_mv / 1000.0f, batteryData.current_ma, batteryData.die_temp_c,
+                     soc >= 0 ? String(soc).c_str() : "N/A");
+        } else {
+            snprintf(response, sizeof(response), "Err: Sensors not ready");
+        }
+
+    } else if (strcmp(trimmed, "conf") == 0) {
+        // All configuration values (MeshCore format)
+        const char *batType = chemistryToString(boardConfig.chemistry);
+        const char *frostStr = (boardConfig.chemistry == BatteryChemistry::LTO_2S) ? "N/A" : (boardConfig.frostProtect ? "on" : "off");
+        const ChemistryParams &params = getChemistryParams(boardConfig.chemistry);
+        snprintf(response, sizeof(response), "B:%s F:%s M:%s I:%umA Vco:%.2f V0:%.2f",
+                 batType, frostStr, boardConfig.mpptEnabled ? "1" : "0",
+                 boardConfig.chargeCurrentMax_mA,
+                 params.chargeVoltage_mV / 1000.0f, params.emptyVoltage_mV / 1000.0f);
+
+    } else if (strcmp(trimmed, "diag") == 0) {
+        // Diagnostics
         uint16_t diagFlags = ina228Ok ? ina228.getDiagnosticFlags() : 0;
         bq_charging_status_t chgStatus = bq25798Ok ? bq25798.getChargingStatus() : BQ_CHARGE_NOT_CHARGING;
         bool pgood = bq25798Ok ? bq25798.getChargerStatusPowerGood() : false;
-        snprintf(response, sizeof(response), "ina228=%s bq25798=%s diag=0x%04X chg=%u pgood=%u", ina228Ok ? "ok" : "fail",
-                 bq25798Ok ? "ok" : "fail", diagFlags, (uint8_t)chgStatus, pgood ? 1 : 0);
+        snprintf(response, sizeof(response), "ina228=%s bq25798=%s diag=0x%04X chg=%u pgood=%u",
+                 ina228Ok ? "ok" : "fail", bq25798Ok ? "ok" : "fail",
+                 diagFlags, (uint8_t)chgStatus, pgood ? 1 : 0);
+
+    } else if (strcmp(trimmed, "leds") == 0) {
+        snprintf(response, sizeof(response), "LEDs: %s (Heartbeat + BQ Stat)",
+                 boardConfig.ledsEnabled ? "ON" : "OFF");
+
+    } else if (strcmp(trimmed, "uvlo") == 0) {
+        snprintf(response, sizeof(response), "UVLO: %s",
+                 boardConfig.uvloEnabled ? "ENABLED" : "DISABLED");
+
+    } else if (strcmp(trimmed, "ibcal") == 0) {
+        snprintf(response, sizeof(response), "INA228 calibration: %.4f (1.0=default)",
+                 boardConfig.inaCalibration);
+
+    } else if (strcmp(trimmed, "tccal") == 0) {
+        snprintf(response, sizeof(response), "TC offset: %+.2fC (0.00=default)",
+                 boardConfig.tcCalOffset);
+
+    } else if (strcmp(trimmed, "batcap") == 0) {
+        if (boardConfig.batteryCapacity_mAh > 0) {
+            snprintf(response, sizeof(response), "%u mAh (set)", boardConfig.batteryCapacity_mAh);
+        } else {
+            uint8_t idx = (uint8_t)boardConfig.chemistry;
+            if (idx >= sizeof(defaultBatteryCapacity) / sizeof(defaultBatteryCapacity[0]))
+                idx = (uint8_t)BatteryChemistry::BAT_UNKNOWN;
+            snprintf(response, sizeof(response), "%u mAh (default)", defaultBatteryCapacity[idx]);
+        }
+
+    } else if (strcmp(trimmed, "energy") == 0) {
+        if (ina228Ok) {
+            float charge_mah = ina228.readCharge_mAh();
+            snprintf(response, sizeof(response), "%.1fmAh", charge_mah);
+        } else {
+            snprintf(response, sizeof(response), "Err: INA228 not initialized");
+        }
 
     } else {
         snprintf(response, sizeof(response),
-                 "cmds: get status|config|diag, set bat|imax|mppt|leds|frost|cal <val>");
+                 "Err: Try board.<bat|hwver|frost|imax|telem|conf|diag|mppt|leds|uvlo|ibcal|tccal|batcap|energy>");
     }
 
-    if (response[0] != '\0') {
-        sendTextReply(mp, response);
-    }
+    sendTextReply(mp, response);
 }
+
+// ============================================================
+// /set board.<key> <value> — MeshCore setCustomSetter compatible
+// ============================================================
+
+void InheroMr2Module::handleSetCommand(const meshtastic_MeshPacket &mp, const char *keyAndValue)
+{
+    char response[256] = {0};
+
+    // --- set board.bat <type> ---
+    if (strncmp(keyAndValue, "bat ", 4) == 0) {
+        const char *val = keyAndValue + 4;
+        while (*val == ' ') val++;
+
+        BatteryChemistry newChem = stringToChemistry(val);
+        if (newChem != BatteryChemistry::BAT_UNKNOWN) {
+            boardConfig.chemistry = newChem;
+            saveConfig();
+            applyChemistryConfig();
+            snprintf(response, sizeof(response), "Bat set to %s", chemistryToString(boardConfig.chemistry));
+        } else {
+            snprintf(response, sizeof(response), "Err: Try lto2s|lifepo1s|liion1s");
+        }
+
+    // --- set board.frost <0|1|on|off> ---
+    } else if (strncmp(keyAndValue, "frost ", 6) == 0) {
+        if (boardConfig.chemistry == BatteryChemistry::LTO_2S) {
+            snprintf(response, sizeof(response), "Err: Frost setting N/A for LTO (JEITA disabled)");
+        } else {
+            const char *val = keyAndValue + 6;
+            while (*val == ' ') val++;
+            bool enabled = (strcmp(val, "1") == 0 || strcmp(val, "on") == 0);
+            bool disabled = (strcmp(val, "0") == 0 || strcmp(val, "off") == 0);
+            if (enabled || disabled) {
+                boardConfig.frostProtect = enabled;
+                saveConfig();
+                applyChemistryConfig();
+                snprintf(response, sizeof(response), "Frost %s", enabled ? "enabled" : "disabled");
+            } else {
+                snprintf(response, sizeof(response), "Err: Try 0|1 or on|off");
+            }
+        }
+
+    // --- set board.imax <10-1000> ---
+    } else if (strncmp(keyAndValue, "imax ", 5) == 0) {
+        const char *val = keyAndValue + 5;
+        while (*val == ' ') val++;
+        int ma = atoi(val);
+        if (ma >= 10 && ma <= 1000) {
+            boardConfig.chargeCurrentMax_mA = (uint16_t)ma;
+            saveConfig();
+            if (bq25798Ok)
+                bq25798.setChargeLimitA(boardConfig.chargeCurrentMax_mA / 1000.0f);
+            snprintf(response, sizeof(response), "Max charge current set to %umA", boardConfig.chargeCurrentMax_mA);
+        } else {
+            snprintf(response, sizeof(response), "Err: imax range 10-1000 mA");
+        }
+
+    // --- set board.mppt <true|false|1|0> ---
+    } else if (strncmp(keyAndValue, "mppt ", 5) == 0) {
+        const char *val = keyAndValue + 5;
+        while (*val == ' ') val++;
+
+        // Case-insensitive compare
+        char lower[20];
+        strncpy(lower, val, sizeof(lower) - 1);
+        lower[sizeof(lower) - 1] = '\0';
+        for (char *p = lower; *p; ++p) *p = tolower(*p);
+
+        if (strcmp(lower, "true") == 0 || strcmp(lower, "1") == 0) {
+            boardConfig.mpptEnabled = true;
+            saveConfig();
+            if (bq25798Ok) bq25798.setMPPTenable(true);
+            snprintf(response, sizeof(response), "MPPT enabled");
+        } else if (strcmp(lower, "false") == 0 || strcmp(lower, "0") == 0) {
+            boardConfig.mpptEnabled = false;
+            saveConfig();
+            if (bq25798Ok) bq25798.setMPPTenable(false);
+            snprintf(response, sizeof(response), "MPPT disabled");
+        } else {
+            snprintf(response, sizeof(response), "Err: Try true|false or 1|0");
+        }
+
+    // --- set board.leds <on|off|1|0> ---
+    } else if (strncmp(keyAndValue, "leds ", 5) == 0) {
+        const char *val = keyAndValue + 5;
+        while (*val == ' ') val++;
+        bool enabled = (strcmp(val, "1") == 0 || strcmp(val, "on") == 0 || strcmp(val, "ON") == 0);
+        bool disabled = (strcmp(val, "0") == 0 || strcmp(val, "off") == 0 || strcmp(val, "OFF") == 0);
+        if (enabled || disabled) {
+            boardConfig.ledsEnabled = enabled;
+            saveConfig();
+            updateLEDs();
+            snprintf(response, sizeof(response), "LEDs %s", enabled ? "enabled" : "disabled");
+        } else {
+            snprintf(response, sizeof(response), "Err: Use on/1 or off/0");
+        }
+
+    // --- set board.uvlo <true|false|1|0> ---
+    } else if (strncmp(keyAndValue, "uvlo ", 5) == 0) {
+        const char *val = keyAndValue + 5;
+        while (*val == ' ') val++;
+        bool enabled = (strcmp(val, "1") == 0 || strcmp(val, "true") == 0);
+        bool disabled = (strcmp(val, "0") == 0 || strcmp(val, "false") == 0);
+        if (enabled || disabled) {
+            boardConfig.uvloEnabled = enabled;
+            saveConfig();
+            if (ina228Ok) {
+                const ChemistryParams &params = getChemistryParams(boardConfig.chemistry);
+                if (enabled) {
+                    ina228.setUnderVoltageAlert(params.dangerVoltage_mV);
+                    ina228.enableAlert(true, false, false);
+                } else {
+                    ina228.enableAlert(false, false, false);
+                }
+            }
+            snprintf(response, sizeof(response), "UVLO %s", enabled ? "ENABLED" : "DISABLED");
+        } else {
+            snprintf(response, sizeof(response), "Err: Use true/1 or false/0");
+        }
+
+    // --- set board.ibcal <mA|reset> ---
+    } else if (strncmp(keyAndValue, "ibcal ", 6) == 0) {
+        const char *val = keyAndValue + 6;
+        while (*val == ' ') val++;
+
+        if (strcmp(val, "reset") == 0 || strcmp(val, "RESET") == 0) {
+            boardConfig.inaCalibration = 1.0f;
+            saveConfig();
+            if (ina228Ok) ina228.setCalibrationFactor(1.0f);
+            snprintf(response, sizeof(response), "INA228 calibration reset to 1.0000");
+        } else {
+            float actual_ma = atof(val);
+            if (actual_ma < -2000.0f || actual_ma > 2000.0f) {
+                snprintf(response, sizeof(response), "Err: Current out of range (-2000 to +2000 mA)");
+            } else if (ina228Ok) {
+                float measured = batteryData.current_ma;
+                if (fabsf(measured) < 1.0f) {
+                    snprintf(response, sizeof(response), "Err: Current too low for calibration (%.1fmA)", measured);
+                } else {
+                    float factor = boardConfig.inaCalibration * (actual_ma / measured);
+                    boardConfig.inaCalibration = factor;
+                    saveConfig();
+                    ina228.setCalibrationFactor(factor);
+                    snprintf(response, sizeof(response), "INA228 calibrated: factor=%.4f", factor);
+                }
+            } else {
+                snprintf(response, sizeof(response), "Err: INA228 not initialized");
+            }
+        }
+
+    // --- set board.tccal [temp|reset] ---
+    } else if (strncmp(keyAndValue, "tccal", 5) == 0) {
+        const char *rest = keyAndValue + 5;
+        if (*rest == ' ') rest++;
+        while (*rest == ' ') rest++;
+
+        if (strcmp(rest, "reset") == 0 || strcmp(rest, "RESET") == 0) {
+            boardConfig.tcCalOffset = 0.0f;
+            saveConfig();
+            snprintf(response, sizeof(response), "TC calibration reset to 0.00");
+        } else if (*rest != '\0') {
+            float actual_temp = atof(rest);
+            if (actual_temp < -40.0f || actual_temp > 85.0f) {
+                snprintf(response, sizeof(response), "Err: Temp out of range (-40 to +85 C)");
+            } else {
+                float measured = batteryData.die_temp_c;
+                boardConfig.tcCalOffset = actual_temp - measured;
+                saveConfig();
+                snprintf(response, sizeof(response), "TC calibrated: offset=%+.2fC", boardConfig.tcCalOffset);
+            }
+        } else {
+            snprintf(response, sizeof(response), "Err: Use /set board.tccal <temp_C> or /set board.tccal reset");
+        }
+
+    // --- set board.batcap <100-100000> ---
+    } else if (strncmp(keyAndValue, "batcap ", 7) == 0) {
+        const char *val = keyAndValue + 7;
+        while (*val == ' ') val++;
+        uint32_t cap = (uint32_t)atol(val);
+        if (cap >= 100 && cap <= 100000) {
+            boardConfig.batteryCapacity_mAh = cap;
+            saveConfig();
+            snprintf(response, sizeof(response), "Battery capacity set to %u mAh", cap);
+        } else {
+            snprintf(response, sizeof(response), "Err: Invalid capacity (100-100000 mAh)");
+        }
+
+    // --- set board.bqreset ---
+    } else if (strcmp(keyAndValue, "bqreset") == 0) {
+        if (bq25798Ok) {
+            bq25798.reset();
+            delay(100);
+            applyChemistryConfig();
+            snprintf(response, sizeof(response), "BQ25798 reset done - reconfigured");
+        } else {
+            snprintf(response, sizeof(response), "Err: BQ25798 not initialized");
+        }
+
+    // --- set board.soc <0-100> ---
+    } else if (strncmp(keyAndValue, "soc ", 4) == 0) {
+        const char *val = keyAndValue + 4;
+        while (*val == ' ') val++;
+        int soc = atoi(val);
+        if (soc >= 0 && soc <= 100) {
+            // SOC manual override is informational only in Meshtastic port
+            // (no MeshCore SOC tracker to set)
+            snprintf(response, sizeof(response), "SOC manually set to %d%% (note: no persistent SOC tracker in Meshtastic port)", soc);
+        } else {
+            snprintf(response, sizeof(response), "Err: SOC must be 0-100");
+        }
+
+    } else {
+        snprintf(response, sizeof(response),
+                 "Err: Try board.<bat|imax|frost|mppt|leds|uvlo|ibcal|tccal|batcap|bqreset|soc>");
+    }
+
+    sendTextReply(mp, response);
+}
+
+// ============================================================
+// Text message reply — sends response as DM on TEXT_MESSAGE_APP
+// ============================================================
 
 void InheroMr2Module::sendTextReply(const meshtastic_MeshPacket &mp, const char *text)
 {
-    meshtastic_MeshPacket *p = router->allocForSending();
-    p->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
+    meshtastic_MeshPacket *p = allocDataPacket(); // allocates with our portnum (TEXT_MESSAGE_APP)
     p->to = mp.from;
+    p->channel = mp.channel;
+    p->want_ack = false;
+    p->decoded.want_response = false;
+
     size_t textLen = strlen(text);
     if (textLen > sizeof(p->decoded.payload.bytes))
         textLen = sizeof(p->decoded.payload.bytes);
     memcpy(p->decoded.payload.bytes, text, textLen);
     p->decoded.payload.size = textLen;
-    p->decoded.want_response = false;
     p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
 
     service->sendToMesh(p, RX_SRC_LOCAL, true);
+}
+
+// ============================================================
+// Battery chemistry string helpers (MeshCore compatible names)
+// ============================================================
+
+const char *InheroMr2Module::chemistryToString(BatteryChemistry chem)
+{
+    switch (chem) {
+    case BatteryChemistry::LTO_2S:      return "lto2s";
+    case BatteryChemistry::LiFePO4_1S:  return "lifepo1s";
+    case BatteryChemistry::Li_Ion_1S:   return "liion1s";
+    default:                            return "unknown";
+    }
+}
+
+BatteryChemistry InheroMr2Module::stringToChemistry(const char *str)
+{
+    // Support both MeshCore names and alternative aliases
+    if (strcmp(str, "lto2s") == 0 || strcmp(str, "lto") == 0)
+        return BatteryChemistry::LTO_2S;
+    if (strcmp(str, "lifepo1s") == 0 || strcmp(str, "lifepo4") == 0 || strcmp(str, "lfp") == 0)
+        return BatteryChemistry::LiFePO4_1S;
+    if (strcmp(str, "liion1s") == 0 || strcmp(str, "liion") == 0)
+        return BatteryChemistry::Li_Ion_1S;
+    return BatteryChemistry::BAT_UNKNOWN;
 }
 
 // === Battery Chemistry & Charger Management ===
@@ -417,12 +820,14 @@ void InheroMr2Module::loadConfig()
     char buf[32];
 
     if (readConfigValue("bat", buf, sizeof(buf)) > 0) {
-        if (strcmp(buf, "lto2s") == 0)
-            boardConfig.chemistry = BatteryChemistry::LTO_2S;
-        else if (strcmp(buf, "lifepo4") == 0)
-            boardConfig.chemistry = BatteryChemistry::LiFePO4_1S;
-        else if (strcmp(buf, "liion") == 0)
-            boardConfig.chemistry = BatteryChemistry::Li_Ion_1S;
+        boardConfig.chemistry = stringToChemistry(buf);
+        if (boardConfig.chemistry == BatteryChemistry::BAT_UNKNOWN && buf[0] != '\0') {
+            // Legacy name fallback
+            if (strcmp(buf, "lifepo4") == 0)
+                boardConfig.chemistry = BatteryChemistry::LiFePO4_1S;
+            else if (strcmp(buf, "liion") == 0)
+                boardConfig.chemistry = BatteryChemistry::Li_Ion_1S;
+        }
     }
 
     if (readConfigValue("imax", buf, sizeof(buf)) > 0)
@@ -440,28 +845,23 @@ void InheroMr2Module::loadConfig()
     if (readConfigValue("cal", buf, sizeof(buf)) > 0)
         boardConfig.inaCalibration = atof(buf);
 
-    LOG_INFO("InheroMr2: Config loaded (bat=%u, imax=%u, mppt=%u)", (uint8_t)boardConfig.chemistry,
-             boardConfig.chargeCurrentMax_mA, boardConfig.mpptEnabled);
+    if (readConfigValue("tccal", buf, sizeof(buf)) > 0)
+        boardConfig.tcCalOffset = atof(buf);
+
+    if (readConfigValue("uvlo", buf, sizeof(buf)) > 0)
+        boardConfig.uvloEnabled = (buf[0] == '1');
+
+    if (readConfigValue("batcap", buf, sizeof(buf)) > 0)
+        boardConfig.batteryCapacity_mAh = (uint32_t)atol(buf);
+
+    LOG_INFO("InheroMr2: Config loaded (bat=%s, imax=%u, mppt=%u, uvlo=%u)",
+             chemistryToString(boardConfig.chemistry),
+             boardConfig.chargeCurrentMax_mA, boardConfig.mpptEnabled, boardConfig.uvloEnabled);
 }
 
 void InheroMr2Module::saveConfig()
 {
-    const char *chemStr = "unknown";
-    switch (boardConfig.chemistry) {
-    case BatteryChemistry::LTO_2S:
-        chemStr = "lto2s";
-        break;
-    case BatteryChemistry::LiFePO4_1S:
-        chemStr = "lifepo4";
-        break;
-    case BatteryChemistry::Li_Ion_1S:
-        chemStr = "liion";
-        break;
-    default:
-        chemStr = "unknown";
-        break;
-    }
-    writeConfigValue("bat", chemStr);
+    writeConfigValue("bat", chemistryToString(boardConfig.chemistry));
 
     char buf[32];
     snprintf(buf, sizeof(buf), "%u", boardConfig.chargeCurrentMax_mA);
@@ -473,6 +873,14 @@ void InheroMr2Module::saveConfig()
 
     snprintf(buf, sizeof(buf), "%.4f", boardConfig.inaCalibration);
     writeConfigValue("cal", buf);
+
+    snprintf(buf, sizeof(buf), "%.2f", boardConfig.tcCalOffset);
+    writeConfigValue("tccal", buf);
+
+    writeConfigValue("uvlo", boardConfig.uvloEnabled ? "1" : "0");
+
+    snprintf(buf, sizeof(buf), "%u", boardConfig.batteryCapacity_mAh);
+    writeConfigValue("batcap", buf);
 
     LOG_INFO("InheroMr2: Config saved");
 }

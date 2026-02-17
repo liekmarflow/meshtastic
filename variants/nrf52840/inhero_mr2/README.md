@@ -17,7 +17,7 @@ Hardware-Variant für das Inhero MR-2 Board auf Basis des RAK4630 (nRF52840 + SX
    - [BQ25798 Solar Charger](#bq25798-solar-charger)
 5. [InheroMr2Module](#inheromr2module)
    - [Telemetrie](#telemetrie)
-   - [Konfigurations-Protokoll](#konfigurations-protokoll)
+   - [Konfigurations-Protokoll (CLI über Text-DMs)](#konfigurations-protokoll-cli-über-text-dms)
    - [Batterie-Chemie](#batterie-chemie)
    - [LittleFS Persistenz](#littlefs-persistenz)
    - [LED-Steuerung](#led-steuerung)
@@ -25,7 +25,7 @@ Hardware-Variant für das Inhero MR-2 Board auf Basis des RAK4630 (nRF52840 + SX
 7. [I2C Scanner Erweiterung](#i2c-scanner-erweiterung)
 8. [Änderungen am Meshtastic-Hauptcode](#änderungen-am-meshtastic-hauptcode)
 9. [Build](#build)
-10. [Konfiguration über Admin-App](#konfiguration-über-admin-app)
+10. [Konfiguration über Text-DMs (CLI)](#konfiguration-über-text-dms-cli)
 
 ---
 
@@ -314,34 +314,87 @@ Die Telemetrie wird als Broadcast gesendet und ist in jeder Standard-Meshtastic-
 
 ---
 
-### Konfigurations-Protokoll
+### Konfigurations-Protokoll (CLI über Text-DMs)
 
-Textbasierte Kommandos auf **PortNum 256** (`PRIVATE_APP`).
+MeshCore-kompatible CLI-Befehle über normale Meshtastic **Textnachrichten (DMs)**. Befehle beginnen mit `/` und werden als direkte Nachricht an den Node gesendet.
 
-#### Lese-Befehle
+#### Authentifizierung
 
-| Befehl | Antwort-Format |
-|---|---|
-| `get status` | `v=3200 i=-120 p=-384 t=32.5 sv=5100 si=200 sp=1020 bt=25.3 sys=3300 soc=75` |
-| `get config` | `bat=lifepo4 imax=500 mppt=1 leds=1 frost=1 cal=1.0000` |
-| `get diag` | `ina228=ok bq25798=ok diag=0x0000 chg=3 pgood=1` |
+Schreib-Befehle (`/set`, `/reboot`) erfordern, dass der **Public Key des Absenders** in `config.security.admin_key[0..2]` eingetragen ist — identisch zum Meshtastic AdminModule.
 
-#### Schreib-Befehle
+- **PKI-verschlüsselte DMs**: Absender-Key kryptographisch verifiziert
+- **Channel-verschlüsselte DMs**: Fallback auf NodeDB-Lookup
+- **Lokale Nachrichten** (Serial/BLE): Immer erlaubt
+
+#### Lese-Befehle (`/get board.<key>`)
+
+| Befehl | Beschreibung | Beispiel-Antwort |
+|---|---|---|
+| `/get board.bat` | Batterie-Chemie | `lifepo1s` |
+| `/get board.hwver` | Hardware-Version | `v0.2 (INA228+RTC)` |
+| `/get board.telem` | Echtzeit-Telemetrie | `B:3.25V/120.5mA/32C SOC:75% S:5.10V/~200mA` |
+| `/get board.conf` | Alle Config-Werte | `B:lifepo1s F:on M:1 I:500mA Vco:3.50 V0:2.95` |
+| `/get board.diag` | Diagnostik | `ina228=ok bq25798=ok diag=0x0000 chg=3 pgood=1` |
+| `/get board.frost` | Frostschutz-Status | `frost=on` |
+| `/get board.imax` | Max. Ladestrom | `500mA` |
+| `/get board.mppt` | MPPT-Status | `MPPT=1` |
+| `/get board.leds` | LED-Status | `LEDs: ON (Heartbeat + BQ Stat)` |
+| `/get board.uvlo` | UVLO-Status | `UVLO: ENABLED` |
+| `/get board.ibcal` | INA228-Kalibrierung | `INA228 calibration: 1.0000 (1.0=default)` |
+| `/get board.tccal` | Temperatur-Kalibrierung | `TC offset: +0.00C (0.00=default)` |
+| `/get board.batcap` | Batterie-Kapazität | `3000 mAh (default)` |
+| `/get board.energy` | Coulomb-Counter | `125.3mAh` |
+
+#### Schreib-Befehle (`/set board.<key> <value>`) — Admin erforderlich
 
 | Befehl | Parameter | Bereich | Beschreibung |
 |---|---|---|---|
-| `set bat <type>` | `lto2s`, `lifepo4`, `liion` | — | Batterie-Chemie |
-| `set imax <mA>` | Ganzzahl | 50–2000 | Max. Ladestrom |
-| `set mppt <0\|1>` | 0 oder 1 | — | MPPT ein/aus |
-| `set leds <0\|1>` | 0 oder 1 | — | LEDs ein/aus |
-| `set frost <0\|1>` | 0 oder 1 | — | Frostschutz (JEITA) |
-| `set cal <factor>` | Float | 0.5–2.0 | INA228 Strom-Kalibrierung |
+| `/set board.bat <type>` | `lto2s`, `lifepo1s`, `liion1s` | — | Batterie-Chemie |
+| `/set board.imax <mA>` | Ganzzahl | 10–1000 | Max. Ladestrom |
+| `/set board.mppt <v>` | `true/1`, `false/0` | — | MPPT ein/aus |
+| `/set board.frost <v>` | `0/off`, `1/on` | — | Frostschutz (JEITA) |
+| `/set board.leds <v>` | `on/1`, `off/0` | — | LEDs ein/aus |
+| `/set board.uvlo <v>` | `true/1`, `false/0` | — | UVLO-Alert ein/aus |
+| `/set board.ibcal <v>` | mA-Wert oder `reset` | −2000–2000 | INA228 Strom-Kalibrierung |
+| `/set board.tccal <v>` | °C-Wert oder `reset` | −40–85 | NTC Temperatur-Kalibrierung |
+| `/set board.batcap <v>` | mAh | 100–100000 | Batterie-Kapazität |
+| `/set board.bqreset` | — | — | BQ25798 Software-Reset |
+| `/set board.soc <v>` | Prozent | 0–100 | SOC manuell setzen |
+
+#### Weitere Befehle
+
+| Befehl | Admin | Beschreibung |
+|---|---|---|
+| `/help` | Nein | Alle verfügbaren Befehle anzeigen |
+| `/ver` | Nein | Firmware-Version anzeigen |
+| `/reboot` | Ja | Node neustarten |
 
 #### Antwort-Format
 
-- Erfolg: `ok <key>=<value>` (z.B. `ok bat=lifepo4`)
-- Fehler: `err: <message>` (z.B. `err: imax out of range (50-2000)`)
-- Hilfe: Unbekannte Befehle geben die Befehlsliste zurück
+- Erfolg: Beschreibender Text (z.B. `Bat set to lifepo1s`)
+- Fehler: `Err: <message>` (z.B. `Err: imax range 10-1000 mA`)
+- Nicht autorisiert: `Err: Not authorized. Your public key must be in admin_key config.`
+
+#### Beispiel-Session (Meshtastic Chat)
+
+```
+Du:     /get board.telem
+MR-2:   B:3.25V/120.5mA/32C SOC:75% S:5.10V/~200mA
+
+Du:     /set board.bat lifepo1s
+MR-2:   Bat set to lifepo1s
+
+Du:     /set board.imax 300
+MR-2:   Max charge current set to 300mA
+
+Du:     /help
+MR-2:   /get board.<key>
+          bat telem conf diag hwver frost imax mppt leds uvlo ibcal tccal batcap energy
+        /set board.<key> <value> [admin]
+          bat <lto2s|lifepo1s|liion1s>
+          imax <10-1000> frost <0|1> mppt <0|1>
+          ...
+```
 
 ---
 
@@ -381,14 +434,18 @@ Konfiguration wird im internen Flash (LittleFS) unter `/inhero/` gespeichert:
 
 | Datei | Inhalt | Beispiel |
 |---|---|---|
-| `/inhero/bat.txt` | Batterie-Chemie | `lifepo4` |
+| `/inhero/bat.txt` | Batterie-Chemie | `lifepo1s` |
 | `/inhero/imax.txt` | Max. Ladestrom | `500` |
 | `/inhero/mppt.txt` | MPPT-Status | `1` |
 | `/inhero/leds.txt` | LED-Status | `1` |
 | `/inhero/frost.txt` | Frostschutz | `1` |
 | `/inhero/cal.txt` | INA228-Kalibrierung | `1.0000` |
+| `/inhero/tccal.txt` | NTC Temp-Kalibrierung | `0.00` |
+| `/inhero/uvlo.txt` | UVLO-Status | `1` |
+| `/inhero/batcap.txt` | Batterie-Kapazität (mAh) | `0` (0 = Default) |
 
-Die Konfiguration wird beim Booten automatisch geladen und bei jedem `set`-Befehl gespeichert.
+Die Konfiguration wird beim Booten automatisch geladen und bei jedem `/set`-Befehl gespeichert.
+Legacy-Werte (`lifepo4`, `liion`) werden beim Laden automatisch auf die MeshCore-Namen (`lifepo1s`, `liion1s`) gemapped.
 
 ---
 
@@ -538,42 +595,57 @@ build_src_filter = ${nrf52_base.build_src_filter}
 
 ---
 
-## Konfiguration über Admin-App
+## Konfiguration über Text-DMs (CLI)
 
-Die Konfiguration erfolgt über eine **eigene App** (nicht die Standard-Meshtastic-App), die Nachrichten auf **PortNum 256** (`PRIVATE_APP`) sendet.
+Die Konfiguration erfolgt über **normale Meshtastic-Textnachrichten (DMs)** — keine spezielle App erforderlich. Jede Standard-Meshtastic-App (Android, iOS, Web, CLI) kann verwendet werden.
+
+### Voraussetzungen
+
+1. **Public Key** des Admin-Geräts muss in `config.security.admin_key[0..2]` eingetragen sein
+2. Nachrichten werden als **DM** (direkte Nachricht) an den MR-2 Node gesendet
+3. Befehle beginnen mit `/`
 
 ### Protokoll
 
-1. App sendet Text-Payload auf PortNum 256 an den Zielknoten
-2. Modul parst den Befehl und führt ihn aus
-3. Antwort wird als Text auf PortNum 256 zurückgesendet
+1. Admin sendet DM mit `/`-Befehl an den MR-2 Node
+2. Modul prüft den Public Key des Absenders gegen `config.security.admin_key[]`
+3. Bei Lesebefehl: Wert wird gelesen und als DM zurückgesendet
+4. Bei Schreibbefehl: Admin-Check → Wert setzen → Bestätigung als DM
+
+### Beispiel (meshtastic CLI)
+
+```bash
+# Telemetrie abfragen (erscheint im Chat)
+meshtastic --sendtext "/get board.telem" --dest '!aabbccdd'
+
+# Batterie-Chemie setzen (Admin-Key erforderlich)
+meshtastic --sendtext "/set board.bat lifepo1s" --dest '!aabbccdd'
+
+# Hilfe anzeigen
+meshtastic --sendtext "/help" --dest '!aabbccdd'
+```
 
 ### Beispiel (Python mit meshtastic-python)
 
 ```python
 import meshtastic
-from meshtastic.protobuf import portnums_pb2
 
 interface = meshtastic.SerialInterface()
 
-# Status abfragen
-interface.sendData(
-    b"get status",
-    portNum=portnums_pb2.PortNum.PRIVATE_APP,
-    destinationId="!aabbccdd"
-)
+# Telemetrie abfragen (-> normale Textnachricht DM)
+interface.sendText("/get board.telem", destinationId="!aabbccdd")
 
 # Batterie-Chemie setzen
-interface.sendData(
-    b"set bat lifepo4",
-    portNum=portnums_pb2.PortNum.PRIVATE_APP,
-    destinationId="!aabbccdd"
-)
+interface.sendText("/set board.bat lifepo1s", destinationId="!aabbccdd")
 ```
 
-### Sicherheitshinweis
+### Sicherheitsmodell
 
-PortNum 256 ist **nicht verschlüsselt** auf der Meshtastic-Ebene (sofern kein PKI verwendet wird). Für produktive Deployments sollte die Konfiguration nur über direkte Verbindung (USB/BLE) erfolgen.
+- **Lesebefehle** (`/get`, `/help`, `/ver`): Keine Admin-Authentifizierung erforderlich
+- **Schreibbefehle** (`/set`, `/reboot`): Public Key muss als `admin_key` konfiguriert sein
+- **PKI-verschlüsselte DMs**: Höchste Sicherheit — Absender-Key kryptographisch verifiziert
+- **Channel-verschlüsselte DMs**: Fallback auf NodeDB-Lookup (weniger sicher)
+- **Lokale Verbindung** (USB/BLE): Immer erlaubt
 
 ---
 
@@ -586,7 +658,8 @@ PortNum 256 ist **nicht verschlüsselt** auf der Meshtastic-Ebene (sofern kein P
 | `Board::setup()` | `InheroMr2Module::setupDrivers()` |
 | `Board::loop()` | `InheroMr2Module::runOnce()` |
 | `BoardConfigContainer` | `InheroMr2Config` + LittleFS |
-| `CLI (get/set board.X)` | Text-Protokoll auf PortNum 256 |
+| `CLI (get/set board.X)` | `/get board.X` / `/set board.X` via Text-DMs |
+| `Admin-Passwort` | `config.security.admin_key[]` (Public Key Auth) |
 | `CayenneLPP Telemetrie` | Meshtastic `PowerMetrics` Protobuf |
 | `MESH_DEBUG_PRINTLN` | `LOG_INFO` / `LOG_WARN` / `LOG_ERROR` |
 | `SimplePreferences` | LittleFS (`/inhero/*.txt`) |
