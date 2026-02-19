@@ -577,12 +577,18 @@ void InheroMr2Module::handleGetCommand(const meshtastic_MeshPacket &mp, const ch
         if (socStats.currentIndex == 0 && socStats.hours[0].timestamp == 0) {
             snprintf(response, sizeof(response), "Stats: No data yet (need >= 1 hour)");
         } else {
+            char ttlBuf[16];
+            if (socStats.ttl_hours >= 24) {
+                snprintf(ttlBuf, sizeof(ttlBuf), "%ud%uh", socStats.ttl_hours / 24, socStats.ttl_hours % 24);
+            } else {
+                snprintf(ttlBuf, sizeof(ttlBuf), "%uh", socStats.ttl_hours);
+            }
             snprintf(response, sizeof(response),
-                     "24h:%.0f/%.0fmAh 3d:%.0f/%.0f 7d:%.0f/%.0f TTL:%uh MPPT:%.0f%%",
+                     "24h:%.0f/%.0fmAh 3d:%.0f/%.0f 7d:%.0f/%.0f TTL:%s MPPT:%.0f%%",
                      socStats.last_24h_charged_mah, socStats.last_24h_discharged_mah,
                      socStats.avg_3day_daily_charged_mah, socStats.avg_3day_daily_discharged_mah,
                      socStats.avg_7day_daily_charged_mah, socStats.avg_7day_daily_discharged_mah,
-                     socStats.ttl_hours, getMpptEnabledPercentage7Day());
+                     ttlBuf, getMpptEnabledPercentage7Day());
         }
 
     } else if (strcmp(trimmed, "cinfo") == 0) {
@@ -1326,8 +1332,13 @@ void InheroMr2Module::updateHourlyStats()
     calculateRollingStats();
     calculateTTL();
 
-    LOG_DEBUG("InheroMr2: Hourly stats updated (idx=%u, 24h_net=%.0fmAh, TTL=%uh)",
-              socStats.currentIndex, socStats.last_24h_net_mah, socStats.ttl_hours);
+    if (socStats.ttl_hours >= 24) {
+        LOG_DEBUG("InheroMr2: Hourly stats updated (idx=%u, 24h_net=%.0fmAh, TTL=%ud%uh)",
+                  socStats.currentIndex, socStats.last_24h_net_mah, socStats.ttl_hours / 24, socStats.ttl_hours % 24);
+    } else {
+        LOG_DEBUG("InheroMr2: Hourly stats updated (idx=%u, 24h_net=%.0fmAh, TTL=%uh)",
+                  socStats.currentIndex, socStats.last_24h_net_mah, socStats.ttl_hours);
+    }
 }
 
 void InheroMr2Module::calculateRollingStats()
