@@ -36,7 +36,7 @@
  *  - MPPT statistics (enabled minutes, harvested energy)
  *
  * === CLI over Text-DM ===
- *  - /get board.<key>: bat telem conf diag hwver frost imax mppt
+ *  - /get board.<key>: bat telem conf diag hwver fmax imax mppt
  *                       leds uvlo ibcal tccal batcap energy
  *                       stats cinfo togglehiz
  *  - /set board.<key> <value>: (admin required)
@@ -403,7 +403,7 @@ void InheroMr2Module::handleCliCommand(const meshtastic_MeshPacket &mp, const ch
         if (strncmp(key, "board.", 6) == 0) {
             handleGetCommand(mp, key + 6);
         } else {
-            sendTextReply(mp, "Err: Try /get board.<key> (bat|telem|conf|diag|hwver|frost|imax|mppt|leds|uvlo|ibcal|tccal|batcap|energy|stats|cinfo|togglehiz)");
+            sendTextReply(mp, "Err: Try /get board.<key> (bat|telem|conf|diag|hwver|fmax|imax|mppt|leds|uvlo|ibcal|tccal|batcap|energy|stats|cinfo|togglehiz)");
         }
 
     } else if (strncmp(cmd, "set ", 4) == 0) {
@@ -420,7 +420,7 @@ void InheroMr2Module::handleCliCommand(const meshtastic_MeshPacket &mp, const ch
         if (strncmp(keyAndValue, "board.", 6) == 0) {
             handleSetCommand(mp, keyAndValue + 6);
         } else {
-            sendTextReply(mp, "Err: Try /set board.<key> <value> (bat|imax|frost|mppt|leds|uvlo|ibcal|tccal|batcap|bqreset|soc)");
+            sendTextReply(mp, "Err: Try /set board.<key> <value> (bat|imax|fmax|mppt|leds|uvlo|ibcal|tccal|batcap|bqreset|soc)");
         }
 
     } else if (strncmp(cmd, "reboot", 6) == 0) {
@@ -440,12 +440,12 @@ void InheroMr2Module::handleCliCommand(const meshtastic_MeshPacket &mp, const ch
         // Send help in multiple messages to avoid payload limit
         sendTextReply(mp,
             "/get board.<key>\n"
-            "  bat telem conf diag hwver frost imax mppt\n"
+            "  bat telem conf diag hwver fmax imax mppt\n"
             "  leds uvlo ibcal tccal batcap energy\n"
             "  stats cinfo togglehiz\n"
             "/set board.<key> <value> [admin]\n"
             "  bat <lto2s|lifepo1s|liion1s>\n"
-            "  imax <10-1000> frost <0|1> mppt <0|1>\n"
+            "  imax <10-1000> fmax <0|1> mppt <0|1>\n"
             "  leds <on|off> uvlo <0|1> soc <0-100>\n"
             "  batcap <100-100000> ibcal <mA|reset>\n"
             "  tccal [temp|reset] bqreset\n"
@@ -479,11 +479,11 @@ void InheroMr2Module::handleGetCommand(const meshtastic_MeshPacket &mp, const ch
     } else if (strcmp(trimmed, "hwver") == 0) {
         snprintf(response, sizeof(response), "v0.2 (INA228+RTC)");
 
-    } else if (strcmp(trimmed, "frost") == 0) {
+    } else if (strcmp(trimmed, "fmax") == 0) {
         if (boardConfig.chemistry == BatteryChemistry::LTO_2S) {
             snprintf(response, sizeof(response), "N/A (LTO ignores JEITA)");
         } else {
-            snprintf(response, sizeof(response), "frost=%s", boardConfig.frostProtect ? "on" : "off");
+            snprintf(response, sizeof(response), "fmax=%s", boardConfig.frostProtect ? "on" : "off");
         }
 
     } else if (strcmp(trimmed, "imax") == 0) {
@@ -620,7 +620,7 @@ void InheroMr2Module::handleGetCommand(const meshtastic_MeshPacket &mp, const ch
 
     } else {
         snprintf(response, sizeof(response),
-                 "Err: Try board.<bat|hwver|frost|imax|telem|conf|diag|mppt|leds|uvlo|ibcal|tccal|batcap|energy|stats|cinfo|togglehiz>");
+                 "Err: Try board.<bat|hwver|fmax|imax|telem|conf|diag|mppt|leds|uvlo|ibcal|tccal|batcap|energy|stats|cinfo|togglehiz>");
     }
 
     sendTextReply(mp, response);
@@ -649,12 +649,12 @@ void InheroMr2Module::handleSetCommand(const meshtastic_MeshPacket &mp, const ch
             snprintf(response, sizeof(response), "Err: Try lto2s|lifepo1s|liion1s");
         }
 
-    // --- set board.frost <0|1|on|off> ---
-    } else if (strncmp(keyAndValue, "frost ", 6) == 0) {
+    // --- set board.fmax <0|1|on|off> ---
+    } else if (strncmp(keyAndValue, "fmax ", 5) == 0) {
         if (boardConfig.chemistry == BatteryChemistry::LTO_2S) {
-            snprintf(response, sizeof(response), "Err: Frost setting N/A for LTO (JEITA disabled)");
+            snprintf(response, sizeof(response), "Err: Fmax setting N/A for LTO (JEITA disabled)");
         } else {
-            const char *val = keyAndValue + 6;
+            const char *val = keyAndValue + 5;
             while (*val == ' ') val++;
             bool enabled = (strcmp(val, "1") == 0 || strcmp(val, "on") == 0);
             bool disabled = (strcmp(val, "0") == 0 || strcmp(val, "off") == 0);
@@ -662,7 +662,7 @@ void InheroMr2Module::handleSetCommand(const meshtastic_MeshPacket &mp, const ch
                 boardConfig.frostProtect = enabled;
                 saveConfig();
                 applyChemistryConfig();
-                snprintf(response, sizeof(response), "Frost %s", enabled ? "enabled" : "disabled");
+                snprintf(response, sizeof(response), "Fmax %s", enabled ? "enabled" : "disabled");
             } else {
                 snprintf(response, sizeof(response), "Err: Try 0|1 or on|off");
             }
@@ -842,7 +842,7 @@ void InheroMr2Module::handleSetCommand(const meshtastic_MeshPacket &mp, const ch
 
     } else {
         snprintf(response, sizeof(response),
-                 "Err: Try board.<bat|imax|frost|mppt|leds|uvlo|ibcal|tccal|batcap|bqreset|soc>");
+                 "Err: Try board.<bat|imax|fmax|mppt|leds|uvlo|ibcal|tccal|batcap|bqreset|soc>");
     }
 
     sendTextReply(mp, response);

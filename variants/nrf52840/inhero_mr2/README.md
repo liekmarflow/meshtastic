@@ -367,7 +367,7 @@ Schreib-Befehle (`/set`, `/reboot`) erfordern, dass der **Public Key des Absende
 | `/get board.telem` | Echtzeit-Telemetrie | `B:3.25V/120.5mA/32C SOC:75% S:5.10V/~200mA` |
 | `/get board.conf` | Alle Config-Werte | `B:lifepo1s F:on M:1 I:500mA Vco:3.50 V0:2.95` |
 | `/get board.diag` | Diagnostik | `ina228=ok bq25798=ok diag=0x0000 chg=3 pgood=1` |
-| `/get board.frost` | Frostschutz-Status | `frost=on` |
+| `/get board.fmax` | Frostschutz-Status | `fmax=on` |
 | `/get board.imax` | Max. Ladestrom | `500mA` |
 | `/get board.mppt` | MPPT-Status | `MPPT=1` |
 | `/get board.leds` | LED-Status | `LEDs: ON (Heartbeat + BQ Stat)` |
@@ -387,7 +387,7 @@ Schreib-Befehle (`/set`, `/reboot`) erfordern, dass der **Public Key des Absende
 | `/set board.bat <type>` | `lto2s`, `lifepo1s`, `liion1s` | — | Batterie-Chemie |
 | `/set board.imax <mA>` | Ganzzahl | 10–1000 | Max. Ladestrom |
 | `/set board.mppt <v>` | `true/1`, `false/0` | — | MPPT ein/aus |
-| `/set board.frost <v>` | `0/off`, `1/on` | — | Frostschutz (JEITA) |
+| `/set board.fmax <v>` | `0/off`, `1/on` | — | Frostschutz (JEITA) |
 | `/set board.leds <v>` | `on/1`, `off/0` | — | LEDs ein/aus |
 | `/set board.uvlo <v>` | `true/1`, `false/0` | — | UVLO-Alert ein/aus |
 | `/set board.ibcal <v>` | mA-Wert oder `reset` | −2000–2000 | INA228 Strom-Kalibrierung |
@@ -433,12 +433,12 @@ MR-2:   HIZ cycled: PG 0->1 CHG:3
 
 Du:     /help
 MR-2:   /get board.<key>
-          bat telem conf diag hwver frost imax mppt
+          bat telem conf diag hwver fmax imax mppt
           leds uvlo ibcal tccal batcap energy
           stats cinfo togglehiz
         /set board.<key> <value> [admin]
           bat <lto2s|lifepo1s|liion1s>
-          imax <10-1000> frost <0|1> mppt <0|1>
+          imax <10-1000> fmax <0|1> mppt <0|1>
           ...
 ```
 
@@ -518,7 +518,7 @@ Konfiguration wird im internen Flash (LittleFS) unter `/inhero/` gespeichert:
 | `/inhero/imax.txt` | Max. Ladestrom | `500` |
 | `/inhero/mppt.txt` | MPPT-Status | `1` |
 | `/inhero/leds.txt` | LED-Status | `1` |
-| `/inhero/frost.txt` | Frostschutz | `1` |
+| `/inhero/frost.txt` | Frostschutz (fmax) | `1` |
 | `/inhero/cal.txt` | INA228-Kalibrierung | `1.0000` |
 | `/inhero/tccal.txt` | NTC Temp-Kalibrierung | `0.00` |
 | `/inhero/uvlo.txt` | UVLO-Status | `1` |
