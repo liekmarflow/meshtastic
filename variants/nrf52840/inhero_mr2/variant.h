@@ -197,6 +197,11 @@ static const uint8_t SCK = PIN_SPI_SCK;
 // Buzzer on IO3 (Slot C)
 #define PIN_BUZZER 21
 
+// BQ25798 Charge Enable pin (active LOW, external pull-up to VSYS)
+// CE HIGH = charging disabled (safe default on boot / unbooted RAK)
+// CE LOW  = charging enabled (only after chemistry is configured)
+#define BQ_CE_PIN (4)  // P0.04 (WB_IO4)
+
 // Onboard sensor configuration
 #define HAS_TELEMETRY 1
 #define HAS_SENSOR 1

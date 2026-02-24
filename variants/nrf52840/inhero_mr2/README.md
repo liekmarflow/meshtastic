@@ -26,6 +26,8 @@ Hardware-Variant für das Inhero MR-2 Board auf Basis des RAK4630 (nRF52840 + SX
    - [GPREGRET2 Shutdown-Tracking](#gpregret2-shutdown-tracking)
    - [Early Boot Spannungsprüfung](#early-boot-spannungsprüfung)
    - [Danger-Zone Shutdown](#danger-zone-shutdown)
+   - [BQ25798 CE-Pin Safety](#bq25798-ce-pin-safety-hardware-ladesicherung)
+   - [SOC-Recovery nach Danger Zone](#soc-recovery-nach-danger-zone)
    - [skipFsWrites bei Low-Voltage Boot](#skipfswrites-bei-low-voltage-boot)
 7. [Solar-MPPT-Management](#solar-mppt-management)
    - [Stuck PGOOD Fix](#stuck-pgood-fix)
@@ -71,6 +73,7 @@ Hardware-Variant für das Inhero MR-2 Board auf Basis des RAK4630 (nRF52840 + SX
 | 3V3 Enable | 34 (P1.02) | Peripherie-Stromversorgung |
 | Battery ADC | A0 (Pin 5) | Batteriespannung (ADC_MULTIPLIER=1.73) |
 | Buzzer | 21 | Piezo-Summer |
+| BQ CE | 4 (P0.04) | BQ25798 Charge Enable (active LOW, ext. Pull-Up zu VSYS) |
 
 ---
 
@@ -108,7 +111,8 @@ Das Design folgt dem Prinzip **"Self-Contained Module"**: Der gesamte board-spez
 │  │  ├─ 168h Energy Analytics│                        │
 │  │  ├─ Solar MPPT Mgmt      │                        │
 │  │  ├─ Watchdog (600s)      │                        │
-│  │  └─ Danger-Zone Shutdown │                        │
+│  │  ├─ Danger-Zone Shutdown │                        │
+│  │  └─ BQ CE-Pin Safety     │                        │
 │  └────────┬─────────────────┘                        │
 │           │ verwendet                                │
 │  ┌────────┴───────┐  ┌────────────────────┐          │
@@ -128,7 +132,7 @@ Das Design folgt dem Prinzip **"Self-Contained Module"**: Der gesamte board-spez
 
 - **Compile-Guard `#ifdef INHERO_MR2`**: Alle board-spezifischen Includes und Registrierungen sind hinter diesem Guard, sodass andere Varianten nicht betroffen sind.
 
-- **RAM-only Energy Analytics**: Wie in MeshCore werden die 168h-Statistiken **nicht** persistiert — sie gehen bei Reboot/Shutdown verloren. Das ist bewusst so, um Flash-Wear zu minimieren.
+- **RAM-only Energy Analytics**: Die 168h-Statistiken liegen im RAM (kein Flash-Wear). Bei Cold Boot oder System OFF gehen sie verloren und werden organisch neu aufgebaut. Nach Danger Zone Recovery wird der SOC auf 0% initialisiert und beim nächsten "Charging Done"-Event des BQ25798 automatisch auf 100% synchronisiert.
 
 ---
 
@@ -144,8 +148,8 @@ Das Design folgt dem Prinzip **"Self-Contained Module"**: Der gesamte board-spez
 | `BQ25798Driver.cpp` | 405 | Steinhart-Hart NTC, One-Shot ADC, Register-Zugriff |
 | `InheroMr2Module.h` | ~310 | Modul-Klasse, Config-Struct, Chemistry-Enum, SOC/MPPT/Hourly-Stats-Structs |
 | `InheroMr2Module.cpp` | ~1590 | Telemetrie, Config-Kommandos, LittleFS, SOC, Energy Analytics, Solar Mgmt, WDT |
-| `variant.h` | ~225 | Pin-Definitionen, Radio-Config, Peripherie |
-| `variant.cpp` | ~90 | GPIO-Map, Early-Boot-Spannungsprüfung, GPREGRET2 Danger-Zone |
+| `variant.h` | ~225 | Pin-Definitionen, Radio-Config, Peripherie, BQ_CE_PIN |
+| `variant.cpp` | ~90 | GPIO-Map, Early-Boot-Spannungsprüfung, CE-Pin HIGH, GPREGRET2 Danger-Zone |
 | `platformio.ini` | 29 | Build-Konfiguration, Library-Dependencies |
 
 ### Modifizierte Dateien (Meshtastic-Kern)
@@ -463,6 +467,10 @@ Unterstützte Chemien mit ihren Spannungsschwellen:
 4. **JEITA-Frostschutz** (wenn aktiviert):
    - Unter 5 °C: Spannung −200 mV, Strom auf 20 %
 5. **INA228 UVLO-Alert** wird auf `dangerVoltage_mV` konfiguriert
+6. **BQ CE-Pin** wird basierend auf der Chemie gesteuert:
+   - `BAT_UNKNOWN` → CE HIGH (Laden gesperrt) + `setChargeEnable(false)` (I2C)
+   - Bekannte Chemie → CE LOW (Laden freigegeben) + `setChargeEnable(true)` (I2C)
+   - **Dual-Layer Safety**: Hardware (CE-Pin) + Software (I2C Register) arbeiten parallel
 
 #### SOC-Schätzung
 
@@ -584,24 +592,28 @@ runOnce() → feedWatchdog()
 **Ablauf:**
 
 ```
-Shutdown (Danger Zone)
+Shutdown (Danger Zone, Low-Voltage)
     │
     ├── GPREGRET2 = reason | DANGER_ZONE_FLAG
-    └── sd_power_system_off()
-           │
+    └── System ON Idle Loop (sd_app_evt_wait)
+           │ GPIO-Latches bleiben aktiv (CE-Pin LOW)
+           │ RTC Timer-Flag wird I2C-gepollt
            ▼
-Wake (RTC / VBUS)
+RTC Ablauf → Ina228Driver::readVBATDirect() (Spannungscheck im Loop)
     │
-    ├── variant.cpp: initVariant()
-    │   ├── Liest GPREGRET2
-    │   ├── Wenn DANGER_ZONE: Schwelle = 3200 mV (statt 2800 mV)
-    │   ├── VBAT < Schwelle → SYSTEMOFF (mit neuem GPREGRET2)
-    │   └── VBAT >= Schwelle → Clear DANGER_ZONE, normaler Boot
+    ├── VBAT >= dangerVoltage_mV → Spannung erholt
+    │   ├── Clear GPREGRET2 DANGER_ZONE Flag
+    │   └── NVIC_SystemReset() → variant.cpp (2800 mV Schwelle) → normaler Boot
+    │       └── setupDrivers() → SOC auf 0% initialisiert (skipFsWrites)
     │
-    └── InheroMr2Module: setupDrivers()
-        ├── Liest GPREGRET2
-        └── Wenn LOW_VOLTAGE: skipFsWrites = true
+    └── VBAT < dangerVoltage_mV → noch in Danger Zone
+        └── configureRTCWake(wakeHours) → weiter schlafen
 ```
+
+> **Warum Spannungscheck im Loop?** Ein blinder NVIC_SystemReset() würde durch
+> variant.cpp → initVariant() gehen, wo bei niedrigem VBAT `sd_power_system_off()`
+> aufgerufen wird. System OFF **löst die GPIO-Latches** → CE-Pin geht HIGH (Pull-Up)
+> → Solar-Laden wird blockiert. Durch den Check im Loop bleibt CE LOW durchgehend.
 
 ---
 
@@ -631,6 +643,7 @@ Boot → Wire.begin() → INA228::readVBATDirect()
 - Standard-Schwelle: **2800 mV** (unterhalb aller Chemie-Gefahrenschwellen)
 - Danger-Zone-Schwelle: **3200 mV** (hysterese gegen Oszillation)
 - System OFF Modus: Aufwachen durch USB-Verbindung (VBUS) oder RTC-Alarm
+- **BQ CE-Pin**: Wird in `initVariant()` auf HIGH gesetzt (Laden gesperrt) — verhindert, dass der BQ25798 mit Default-Konfiguration (1S/4.2V) eine LiFePO4-Batterie überlädt
 
 ---
 
@@ -638,7 +651,7 @@ Boot → Wire.begin() → INA228::readVBATDirect()
 
 **Datei**: `InheroMr2Module.cpp` → `initiateShutdown(reason)`
 
-Kontrollierter Shutdown bei kritischem Batteriestatus (im Gegensatz zum harten `NRF_POWER->SYSTEMOFF` beim Early Boot):
+Kontrollierter Shutdown bei kritischem Batteriestatus. Bei **Low-Voltage** wird **System ON Idle** statt System OFF verwendet, um GPIO-Latches (insbesondere BQ CE-Pin) zu erhalten:
 
 ```
 batteryData.voltage_mv < dangerVoltage_mV
@@ -646,15 +659,37 @@ batteryData.voltage_mv < dangerVoltage_mV
     ├── 1. SX1262 Radio ausschalten
     │      └── digitalWrite(SX126X_POWER_EN, LOW)
     │
-    ├── 2. RTC Wake konfigurieren
-    │      └── RV-3028 Countdown Timer (2h bei Low-Voltage, 6h bei User-Request)
+    ├── 2. BQ25798 Interrupt deaktivieren
+    │      └── detachInterrupt(BQ_INT_PIN)
+    │      └── Verhindert Spurious-Wakeups durch Solar-Events
     │
-    ├── 3. GPREGRET2 speichern
+    ├── 3. RTC Wake konfigurieren
+    │      └── RV-3028 Countdown Timer (2h)
+    │
+    ├── 4. GPREGRET2 speichern
     │      └── reason | DANGER_ZONE_FLAG
     │
-    └── 4. sd_power_system_off()
-           └── Wacht per RTC-Interrupt auf
+    └── 5. System ON Idle Loop (Low-Voltage)
+           │
+           ├── sd_app_evt_wait()  ← CPU schläft (~3µA)
+           ├── RTC TF-Flag pollen (I2C Reg 0x0E, Bit 3)
+           ├── Bei RTC-Ablauf:
+           │   ├── readVBATDirect() → Spannung prüfen
+           │   ├── VBAT >= dangerVoltage → Clear DANGER_ZONE → NVIC_SystemReset()
+           │   └── VBAT < dangerVoltage → configureRTCWake() → weiter schlafen
+           └── Watchdog füttern (NRF_WDT->RR[0])
 ```
+
+**Warum System ON Idle statt System OFF?**
+- System OFF → alle GPIOs werden High-Z → CE-Pin Pull-Up → HIGH → Laden gesperrt
+- System ON Idle → GPIO-Latches bleiben aktiv → CE-Pin bleibt LOW → **Solar-Laden weiterhin möglich**
+- Stromverbrauch: ~3µA (System ON Idle) vs. ~2µA (System OFF) — vernachlässigbar
+
+**Warum Spannungscheck im Loop statt NVIC_SystemReset()?**
+- Ein blinder Reset würde in variant.cpp landen → `sd_power_system_off()` bei niedrigem VBAT → **GPIO-Latches gelöst** → CE HIGH → Solar blockiert
+- Der In-Loop-Check vermeidet diesen Umweg: CE bleibt durchgehend LOW, bis die Spannung tatsächlich erholt ist
+
+**Nicht-Low-Voltage Shutdowns** (User Request, Thermal): Verwenden weiterhin `sd_power_system_off()`, da hier kein Solar-Recovery nötig ist.
 
 **RTC-Wake-Konfiguration** (RV-3028 @ 0x52):
 
@@ -664,6 +699,90 @@ batteryData.voltage_mv < dangerVoltage_mV
 | 0x0E | 0x00 | Status — Timer-Flag löschen |
 | 0x0F | 0x02 | Control 1 — Timer Interrupt Enable (TIE) |
 | 0x10 | 0x06 | Control 2 — Timer Enable + 1/60 Hz Clock |
+
+---
+
+### BQ25798 CE-Pin Safety (Hardware-Ladesicherung)
+
+**Pin**: `BQ_CE_PIN` = GPIO 4 (P0.04 / WB_IO4)
+**Hardware**: Externer Pull-Up (10kΩ) zu VSYS → CE HIGH = Laden gesperrt (sicherer Default)
+**Logik**: Active LOW (CE LOW = Laden freigegeben)
+
+#### Problem
+
+Der BQ25798 startet mit Default-Konfiguration (1S Li-Ion, 4.2V Ladespannung). Wenn eine LiFePO4-Batterie (3.5V max) verbunden ist und der RAK noch nicht gebootet hat, würde der BQ25798 die Batterie überladen → **Brandgefahr**.
+
+#### Lösung: 3-Schicht-Sicherung
+
+```
+Schicht 1 — Hardware (passiv):
+    Externer Pull-Up → CE HIGH → Laden gesperrt wenn RAK stromlos
+
+Schicht 2 — Early Boot (variant.cpp / begin()):
+    pinMode(BQ_CE_PIN, OUTPUT);
+    digitalWrite(BQ_CE_PIN, HIGH);    // Explizit HIGH setzen
+    // → Laden bleibt gesperrt bis Chemie konfiguriert ist
+
+Schicht 3 — Chemie-Konfiguration (applyChemistryConfig):
+    if (chemistry != BAT_UNKNOWN) {
+        // BQ25798 Register konfiguriert (VREG, ICHG, MPPT, JEITA)
+        digitalWrite(BQ_CE_PIN, LOW);     // Hardware: Laden freigeben
+        bq.setChargeEnable(true);         // Software: Laden freigeben
+    } else {
+        digitalWrite(BQ_CE_PIN, HIGH);    // Hardware: Laden gesperrt
+        bq.setChargeEnable(false);        // Software: Laden gesperrt
+    }
+```
+
+#### Dual-Layer Safety
+
+| Schicht | Mechanismus | Schutz bei | Latenz |
+|---|---|---|---|
+| **Hardware (CE-Pin)** | GPIO → BQ25798 CE | RAK stromlos, Boot, System ON Idle | 0 (instant) |
+| **Software (I2C)** | `setChargeEnable()` Register | Fehlerhafte GPIO-Konfiguration | ~1ms (I2C) |
+
+#### Verhalten in verschiedenen Zuständen
+
+| Zustand | CE-Pin | Laden | Erklärung |
+|---|---|---|---|
+| RAK stromlos | HIGH (Pull-Up) | Gesperrt | Hardware-Default, sicher |
+| Early Boot | HIGH (explizit) | Gesperrt | Vor Chemie-Konfiguration |
+| BAT_UNKNOWN | HIGH | Gesperrt | Keine Chemie → kein Laden |
+| Chemie konfiguriert | LOW | Freigegeben | VREG/ICHG/JEITA gesetzt |
+| System ON Idle (Danger Zone) | LOW (gelatcht) | **Freigegeben** | Solar-Recovery möglich |
+| System OFF | HIGH (Pull-Up) | Gesperrt | GPIOs werden High-Z |
+
+---
+
+### SOC-Recovery nach Danger Zone
+
+Nach einem Danger-Zone-Reboot (`GPREGRET2 & 0x03 == LOW_VOLTAGE`) wird der SOC automatisch auf **0%** initialisiert (`setSOCManually(0.0f)`). Dies ist realistisch, da die Batterie knapp über der kritischen Schwelle liegt.
+
+**Recovery-Ablauf:**
+
+```
+Danger Zone Recovery Boot
+    │
+    ├── setupDrivers() erkennt GPREGRET2 LOW_VOLTAGE
+    │      └── skipFsWrites = true
+    │
+    ├── INA228 initialisiert
+    │      └── setSOCManually(0.0f) → SOC = 0%, soc_valid = true
+    │      └── Coulomb-counting startet sofort
+    │
+    ├── Solar lädt Batterie (CE-Pin war LOW im Idle-Loop)
+    │
+    └── BQ25798 meldet "Charging Done"
+           └── syncSOCToFull() → SOC = 100%, Baseline Reset
+           └── Ab hier: ±0.1% Genauigkeit via Coulomb Counter
+```
+
+**Warum 0% statt OCV-basierte Schätzung?**
+- Die Batterie wurde bis zur kritischen Schwelle entladen → ~0% ist realistisch
+- `estimateSOCFromVoltage()` existiert, wird aber nicht automatisch bei Boot aufgerufen
+- 0% mit sofortigem Coulomb-counting ist einfacher und self-correcting (nächstes "Charging Done" → 100%)
+
+**168h-Ringpuffer**: Startet leer nach Danger Zone Recovery. TTL und Tagesbilanz sind erst nach ~24h aussagekräftig — rein kosmetisch, der Node ist sofort funktional.
 
 ---
 
@@ -744,7 +863,7 @@ PGOOD == 1  &&  config.mpptEnabled == true  &&  chip.MPPT == false
 | `discharged_mah` | `float` | Entladene Energie in dieser Stunde (mAh) |
 | `solar_mah` | `float` | Solar-Beitrag in dieser Stunde (mAh) |
 
-**Speicher**: 168 × 16 Bytes = **2.688 Bytes RAM** (kein Flash — flüchtig wie in MeshCore)
+**Speicher**: 168 × 16 Bytes = **2.688 Bytes RAM** (kein Flash). Bei Reboot/Shutdown gehen die Daten verloren und werden organisch neu aufgebaut.
 
 **Timing**: `minuteCounter` zählt in 10s-Zyklen, alle 6 Zyklen (~60s) wird `updateHourlyStats()` aufgerufen. Bei Stundenwechsel wird der aktuelle Slot gespeichert und der Index weitergerückt.
 
@@ -1006,7 +1125,7 @@ interface.sendText("/set board.bat lifepo1s", destinationId="!aabbccdd")
 | `CayenneLPP Telemetrie` | Meshtastic `PowerMetrics` Protobuf |
 | `MESH_DEBUG_PRINTLN` | `LOG_INFO` / `LOG_WARN` / `LOG_ERROR` |
 | `SimplePreferences` | LittleFS (`/inhero/*.txt`) |
-| `NRF52Board::deepSleep()` | `initiateShutdown()` → `sd_power_system_off()` |
+| `NRF52Board::deepSleep()` | `initiateShutdown()` → System ON Idle (Low-Voltage) / `sd_power_system_off()` (sonst) |
 | `GPREGRET2 Check (begin)` | `variant.cpp::initVariant()` + `setupDrivers()` |
 | `nRF52 WDT (600s)` | `setupWatchdog()` / `feedWatchdog()` |
 | `SolarDaemonTask` | `checkAndFixPgoodStuck()` + `checkAndFixSolarLogic()` in `runOnce()` |
@@ -1037,4 +1156,4 @@ interface.sendText("/set board.bat lifepo1s", destinationId="!aabbccdd")
 7. **Energy Analytics**: Identische Ringpuffer-Logik (168h), identische RAM-only-Speicherung
 8. **Watchdog**: Identisch (nRF52 WDT, 600s)
 9. **GPREGRET2**: Identische Bit-Zuordnung und Logik
-10. **Shutdown**: Identisch (SX1262 aus → RTC Wake → GPREGRET2 → SYSTEMOFF)
+10. **Shutdown**: Bei Low-Voltage: System ON Idle (GPIO-Latches für CE-Pin erhalten), sonst: SYSTEMOFF

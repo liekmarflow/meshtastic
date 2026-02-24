@@ -64,6 +64,15 @@ void initVariant()
     pinMode(PIN_3V3_EN, OUTPUT);
     digitalWrite(PIN_3V3_EN, HIGH);
 
+    // BQ25798 CE pin: Drive HIGH (charging disabled) on every boot.
+    // External pull-up holds CE HIGH when RAK is unpowered, but we make the
+    // safe state explicit. applyChemistryConfig() in InheroMr2Module will
+    // pull CE LOW only after successful BQ I2C config with a known battery type.
+#ifdef BQ_CE_PIN
+    pinMode(BQ_CE_PIN, OUTPUT);
+    digitalWrite(BQ_CE_PIN, HIGH);
+#endif
+
     // Early boot voltage check via INA228
     // Prevents motorboating (boot-crash-reboot loop) when battery is critically low
     Wire.begin();

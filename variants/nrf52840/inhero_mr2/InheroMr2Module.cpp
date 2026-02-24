@@ -120,6 +120,9 @@ bool InheroMr2Module::setupDrivers()
     if ((shutdownReason & 0x03) == SHUTDOWN_REASON_LOW_VOLTAGE) {
         skipFsWrites = true;
         LOG_WARN("InheroMr2: Low-voltage boot detected (GPREGRET2=0x%02X) — skipping FS writes", shutdownReason);
+
+        // Clear GPREGRET2 so a subsequent warm reset doesn't re-trigger this path
+        sd_power_gpregret_clr(1, 0xFF);
     }
 #endif
 
@@ -142,7 +145,7 @@ bool InheroMr2Module::setupDrivers()
     bq25798Ok = bq25798.begin(BQ25798_DEFAULT_ADDR, &Wire);
     if (bq25798Ok) {
         LOG_INFO("InheroMr2: BQ25798 OK");
-        // Apply battery chemistry config to charger
+        // Apply battery chemistry config to charger (also sets CE pin)
         applyChemistryConfig();
         // Configure interrupts for solar events only
         bq25798.configureSolarOnlyInterrupts();
@@ -150,6 +153,11 @@ bool InheroMr2Module::setupDrivers()
         bq25798.setStatPinEnable(boardConfig.ledsEnabled);
     } else {
         LOG_WARN("InheroMr2: BQ25798 FAILED");
+        // BQ not found — ensure CE stays HIGH (charging disabled)
+#ifdef BQ_CE_PIN
+        pinMode(BQ_CE_PIN, OUTPUT);
+        digitalWrite(BQ_CE_PIN, HIGH);
+#endif
     }
 
     // Detect RV-3028 RTC for hourly stats timestamps
@@ -163,6 +171,14 @@ bool InheroMr2Module::setupDrivers()
 
     // Initialize SOC stats capacity from config
     socStats.capacity_mah = (float)getEffectiveCapacity();
+
+    // After danger zone recovery, set SOC to 0% — battery was critically low,
+    // solar just charged it past the threshold. Coulomb counting starts from 0%
+    // and auto-corrects to 100% when BQ25798 signals "Charging Done".
+    if (skipFsWrites && ina228Ok) {
+        setSOCManually(0.0f);
+        LOG_INFO("InheroMr2: SOC set to 0%% (danger zone recovery)");
+    }
 
     // Initialize hourly stats timestamp
     uint32_t now_time = getTime();
@@ -911,6 +927,26 @@ void InheroMr2Module::applyChemistryConfig()
 
     const ChemistryParams &params = getChemistryParams(boardConfig.chemistry);
 
+    // CE-Pin hardware safety: Only enable charging for known battery chemistry.
+    // BAT_UNKNOWN keeps CE HIGH (charging disabled) as hardware-level protection
+    // against overcharging an unconfigured battery (e.g. LiFePO4 at 4.2V default).
+    bool chargeEnabled = (boardConfig.chemistry != BatteryChemistry::BAT_UNKNOWN);
+#ifdef BQ_CE_PIN
+    pinMode(BQ_CE_PIN, OUTPUT);
+    digitalWrite(BQ_CE_PIN, chargeEnabled ? LOW : HIGH);
+    LOG_INFO("InheroMr2: CE pin %s (chemistry=%s)",
+             chargeEnabled ? "LOW (charging enabled)" : "HIGH (charging disabled)",
+             chemistryToString(boardConfig.chemistry));
+#endif
+
+    // Also set the I2C charge enable register (defense in depth)
+    bq25798.setChargeEnable(chargeEnabled);
+
+    if (!chargeEnabled) {
+        LOG_WARN("InheroMr2: Chemistry UNKNOWN — charging disabled (CE + register)");
+        return;
+    }
+
     // Set charge voltage limit (API expects volts)
     bq25798.setChargeLimitV(params.chargeVoltage_mV / 1000.0f);
 
@@ -1175,6 +1211,10 @@ void InheroMr2Module::initiateShutdown(uint8_t reason)
     delay(10);
     #endif
 
+    // Turn off LEDs
+    ledOff(PIN_LED1);
+    ledOff(PIN_LED2);
+
     // Configure RTC wake (6 hours default, 2 hours on low-voltage)
     uint32_t wakeHours = (reason == SHUTDOWN_REASON_LOW_VOLTAGE) ? 2 : 6;
     if (rtcOk) {
@@ -1188,7 +1228,81 @@ void InheroMr2Module::initiateShutdown(uint8_t reason)
     sd_power_gpregret_clr(1, 0xFF);  // GPREGRET2 = index 1
     sd_power_gpregret_set(1, regval);
 
-    // Halt
+    if (reason == SHUTDOWN_REASON_LOW_VOLTAGE) {
+        // System ON Idle: GPIO outputs remain latched → BQ_CE_PIN stays LOW
+        // This allows BQ25798 to continue solar charging autonomously.
+        // BQ25798 MPPT/CC/CV runs entirely in hardware — no CPU assistance needed.
+        // Power: ~3 µA total (vs ~2 µA System OFF), enables solar recovery.
+        //
+        // CRITICAL: We check voltage IN the idle loop rather than rebooting
+        // after each RTC wake. An intermediate NVIC_SystemReset() would go through
+        // begin() → variant.cpp → if still low → sd_power_system_off() which
+        // RELEASES GPIO latches → CE pin goes HIGH via pull-up → solar charging
+        // blocked! By staying in the idle loop, CE stays LOW the entire time.
+
+        LOG_INFO("InheroMr2: Entering System ON Idle (CE pin preserved for solar charging)");
+        delay(50);
+
+        // Get critical voltage threshold for this battery chemistry
+        const uint16_t critical_threshold = getChemistryParams(boardConfig.chemistry).dangerVoltage_mV;
+
+        // Feed watchdog one last time before entering idle loop
+        feedWatchdog();
+
+        // Idle loop with in-loop voltage check
+        // Only NVIC_SystemReset() when voltage has actually recovered.
+        // RTC timer is single-shot (TRPT=0), so we reconfigure after each fire.
+        while (true) {
+            // Wait for any SoftDevice event (RTC interrupt via I2C polling below)
+            sd_app_evt_wait();
+
+            // Poll RTC timer flag (TF = bit 3 in Status Register 0x0E)
+            if (rtcOk) {
+                Wire.beginTransmission(0x52);
+                Wire.write(0x0E);
+                Wire.endTransmission(false);
+                Wire.requestFrom(0x52, 1);
+                if (Wire.available()) {
+                    uint8_t status = Wire.read();
+                    if (status & 0x08) {
+                        // RTC timer expired — clear TF flag
+                        Wire.beginTransmission(0x52);
+                        Wire.write(0x0E);
+                        Wire.write(status & ~0x08);
+                        Wire.endTransmission();
+
+                        // Check battery voltage via INA228 one-shot read
+                        // readVBATDirect() is static, works without full driver init
+                        uint16_t vbat_mv = Ina228Driver::readVBATDirect(&Wire, INA228_I2C_ADDR_DEFAULT);
+
+                        if (vbat_mv > 0 && vbat_mv >= critical_threshold) {
+                            // Voltage recovered — safe to reboot into normal operation
+                            // Clear DANGER_ZONE flag so variant.cpp uses the lower boot
+                            // threshold (2800 mV). Keep LOW_VOLTAGE reason bits so
+                            // setupDrivers() can restore .noinit stats.
+                            sd_power_gpregret_clr(1, GPREGRET2_IN_DANGER_ZONE);
+                            LOG_INFO("InheroMr2: Voltage recovered (%u mV >= %u mV) — rebooting",
+                                     vbat_mv, critical_threshold);
+                            delay(50);
+                            NVIC_SystemReset();
+                            // Never returns
+                        }
+
+                        // Still below critical — reconfigure RTC for another cycle
+                        LOG_INFO("InheroMr2: Still in danger zone (%u mV < %u mV) — sleeping %u more hours",
+                                 vbat_mv, critical_threshold, wakeHours);
+                        delay(50);
+                        configureRTCWake(wakeHours);
+                    }
+                }
+            }
+
+            // Feed watchdog during idle to prevent reset
+            feedWatchdog();
+        }
+    }
+
+    // Non-low-voltage shutdown: use System OFF (user request, thermal)
     sd_power_system_off();
     // Does not return — wakes via RTC interrupt or button
 #endif
