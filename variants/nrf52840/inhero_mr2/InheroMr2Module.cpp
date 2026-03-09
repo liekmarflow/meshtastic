@@ -758,9 +758,10 @@ void InheroMr2Module::handleSetCommand(const meshtastic_MeshPacket &mp, const ch
                 const ChemistryParams &params = getChemistryParams(boardConfig.chemistry);
                 if (enabled) {
                     ina228.setUnderVoltageAlert(params.dangerVoltage_mV);
-                    ina228.enableAlert(true, false, false);
+                    ina228.enableAlert(true, false, true);  // active-LOW, LATCHED
                 } else {
-                    ina228.enableAlert(false, false, false);
+                    ina228.setUnderVoltageAlert(0);  // Clear threshold → disables comparison
+                    ina228.enableAlert(false, false, false);  // Clear all DIAG_ALRT config
                 }
             }
             snprintf(response, sizeof(response), "UVLO %s", enabled ? "ENABLED" : "DISABLED");
@@ -967,10 +968,10 @@ void InheroMr2Module::applyChemistryConfig()
         bq25798.setTsIgnore(true);
     }
 
-    // Configure INA228 UVLO alert based on chemistry
-    if (ina228Ok) {
+    // Configure INA228 UVLO alert based on chemistry (only if UVLO enabled)
+    if (ina228Ok && boardConfig.uvloEnabled) {
         ina228.setUnderVoltageAlert(params.dangerVoltage_mV);
-        ina228.enableAlert(true, false, false); // UVLO, active-low, transparent mode
+        ina228.enableAlert(true, false, true); // UVLO, active-low, latched
     }
 
     LOG_INFO("InheroMr2: Applied chemistry config (charge=%umV, danger=%umV, imax=%umA, mppt=%u)", params.chargeVoltage_mV,
